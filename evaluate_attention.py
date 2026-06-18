@@ -101,9 +101,17 @@ def _maybe_empty_cache():
 def _baseline_attention(q, k, v, h: int, causal: bool, sm_scale: float):
     atten_mask = None
     sparse_mode = 0
+    pre_tockens = 65535
+    next_tockens = 65535
     if causal:
-        atten_mask = torch.triu(torch.ones(q.shape[-2], q.shape[-2], device=q.device), diagonal=1).bool()
-        sparse_mode = 2
+        # `sparse_mode=2` only accepts a compressed 2048x2048 causal mask on this torch_npu build.
+        # Use defaultMask mode so generic causal sequence lengths, such as 1024, remain supported.
+        atten_mask = torch.triu(
+            torch.ones((q.shape[-2], k.shape[-2]), device=q.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        pre_tockens = q.shape[-2]
+        next_tockens = 0
     return torch_npu.npu_fusion_attention(
         q,
         k,
@@ -114,8 +122,8 @@ def _baseline_attention(q, k, v, h: int, causal: bool, sm_scale: float):
         scale=sm_scale,
         keep_prob=1.0,
         input_layout="BNSD",
-        pre_tockens=65535,
-        next_tockens=65535,
+        pre_tockens=pre_tockens,
+        next_tockens=next_tockens,
         sparse_mode=sparse_mode,
     )[0]
 

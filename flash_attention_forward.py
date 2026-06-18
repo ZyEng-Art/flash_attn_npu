@@ -1097,9 +1097,17 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype, BM, BN):
 
     atten_mask = None
     sparse_mode = 0
+    pre_tockens = 65535
+    next_tockens = 65535
     if causal:
-        atten_mask = torch.triu(torch.ones(N_CTX, N_CTX, device=DEVICE), diagonal=1).bool()
-        sparse_mode = 2
+        # `sparse_mode=2` requires a compressed 2048x2048 causal mask on this torch_npu build.
+        # Keep the reference path on defaultMask mode so smaller causal shapes can still run.
+        atten_mask = torch.triu(
+            torch.ones((N_CTX, N_CTX), device=DEVICE, dtype=torch.bool),
+            diagonal=1,
+        )
+        pre_tockens = N_CTX
+        next_tockens = 0
 
     try:
         ref_out = torch_npu.npu_fusion_attention(
@@ -1112,8 +1120,8 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype, BM, BN):
             scale=sm_scale,
             keep_prob=1.0,
             input_layout="BNSD",
-            pre_tockens=65535,
-            next_tockens=65535,
+            pre_tockens=pre_tockens,
+            next_tockens=next_tockens,
             sparse_mode=sparse_mode,
         )[0]
     except RuntimeError as exc:
@@ -1126,7 +1134,7 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype, BM, BN):
 
 if __name__ == "__main__":
     Z, H, N_CTX, HEAD_DIM = 128, 8, 1024, 128
-    causal, dtype = False, torch.float16
+    causal, dtype = True, torch.float16
     q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5)
     k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5)
     v = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5)
