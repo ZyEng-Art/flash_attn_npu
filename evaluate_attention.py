@@ -128,19 +128,31 @@ def _baseline_attention(q, k, v, h: int, causal: bool, sm_scale: float):
     )[0]
 
 
+def _torch_attention_reference(q, k, v, causal: bool, sm_scale: float):
+    scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * sm_scale
+    if causal:
+        mask = torch.triu(
+            torch.ones((q.shape[-2], k.shape[-2]), device=q.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        scores = scores.masked_fill(mask, float("-inf"))
+    probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
+    return torch.matmul(probs, v.float()).to(q.dtype)
+
+
 def _candidate_attention(module, q, k, v, causal: bool, sm_scale: float):
-    attention_cls = getattr(module, "attention")
-    return attention_cls.forward(q, k, v, causal, sm_scale).to(q.dtype)
+    attention_fn = getattr(module, "attention")
+    get_tiling = getattr(module, "get_tiling")
+    bm, bn = get_tiling(q.shape[0], q.shape[1], q.shape[2], q.shape[3], causal)
+    return attention_fn(q, k, v, causal, sm_scale, bm, bn).to(q.dtype)
 
 
 def _reference_attention(module, q, k, v, h: int, causal: bool, sm_scale: float):
     try:
         return _baseline_attention(q, k, v, h, causal, sm_scale)
     except RuntimeError as exc:
-        fallback = getattr(module, "_torch_attention_reference", None)
-        if fallback is None:
-            raise RuntimeError(f"torch_npu baseline unavailable and no fallback reference exists: {exc}") from exc
-        return fallback(q, k, v, causal, sm_scale)
+        print(f"torch_npu baseline unavailable, falling back to torch reference: {exc}")
+        return _torch_attention_reference(q, k, v, causal, sm_scale)
 
 
 def _measure_us(fn, warmup: int, iters: int):
