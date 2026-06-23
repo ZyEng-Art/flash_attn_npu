@@ -2,23 +2,23 @@ Evaluation Summary
 ==================
 candidate_module=/workspace/new_attn/flash_attention_forward.py
 dtype=float16, sm_scale=0.5
-correctness_score=40.000 / 40.000, performance_score=2.859 / 60.000, total_score=42.859 / 100
+correctness_score=40.000 / 40.000, performance_score=3.660 / 60.000, total_score=43.660 / 100
 
 Correctness Cases
 -----------------
 [1] shape=(1,1,64,64, causal=False) passed=True score=2.222 max_abs_diff=0.000244 error=
-[2] shape=(1,1,64,64, causal=True) passed=True score=2.222 max_abs_diff=0.000488 error=
+[2] shape=(1,1,64,64, causal=True) passed=True score=2.222 max_abs_diff=0.000244 error=
 [3] shape=(1,1,128,128, causal=False) passed=True score=2.222 max_abs_diff=0.000244 error=
-[4] shape=(1,1,128,128, causal=True) passed=True score=2.222 max_abs_diff=0.000977 error=
+[4] shape=(1,1,128,128, causal=True) passed=True score=2.222 max_abs_diff=0.000488 error=
 [5] shape=(1,2,1024,64, causal=False) passed=True score=2.222 max_abs_diff=0.000061 error=
-[6] shape=(1,2,1024,64, causal=True) passed=True score=2.222 max_abs_diff=0.000488 error=
+[6] shape=(1,2,1024,64, causal=True) passed=True score=2.222 max_abs_diff=0.000244 error=
 [7] shape=(4,32,64,64, causal=False) passed=True score=2.222 max_abs_diff=0.000488 error=
-[8] shape=(4,32,64,64, causal=True) passed=True score=2.222 max_abs_diff=0.000977 error=
+[8] shape=(4,32,64,64, causal=True) passed=True score=2.222 max_abs_diff=0.000244 error=
 [9] shape=(4,32,128,128, causal=False) passed=True score=2.222 max_abs_diff=0.000488 error=
 [10] shape=(4,32,256,128, causal=True) passed=True score=2.222 max_abs_diff=0.000977 error=
-[11] shape=(4,32,512,64, causal=True) passed=True score=2.222 max_abs_diff=0.000977 error=
+[11] shape=(4,32,512,64, causal=True) passed=True score=2.222 max_abs_diff=0.000488 error=
 [12] shape=(4,32,1024,64, causal=False) passed=True score=2.222 max_abs_diff=0.000122 error=
-[13] shape=(4,32,1024,64, causal=True) passed=True score=2.222 max_abs_diff=0.000977 error=
+[13] shape=(4,32,1024,64, causal=True) passed=True score=2.222 max_abs_diff=0.000244 error=
 [14] shape=(4,32,1024,128, causal=False) passed=True score=2.222 max_abs_diff=0.000244 error=
 [15] shape=(4,32,2048,64, causal=True) passed=True score=2.222 max_abs_diff=0.000244 error=
 [16] shape=(4,32,2048,128, causal=False) passed=True score=2.222 max_abs_diff=0.000244 error=
@@ -27,31 +27,9 @@ Correctness Cases
 
 Performance Cases
 -----------------
-[1] shape=(128,8,1024,128, causal=True) match=False score=0.000 baseline_avg_us=n/a candidate_avg_us=n/a speedup=n/a max_abs_diff=n/a error=npu_fusion_attention:../third_party/op-plugin/op_plugin/ops/opapi/FlashAttentionKernelNpuOpApi.cpp:1353 NPU function error: call aclnnFlashAttentionScore failed, error code is 161001
-[ERROR] 2026-06-18-10:22:32 (PID:252559, Device:0, RankID:-1) ERR00100 PTA call acl api failed.
-[PID: 252559] 2026-06-18-10:22:32.715.543 Execution_Error(EZ1009): Failed to execute operator OpName:[aclnnFlashAttentionScore_505_FlashAttentionScore] . Reason: Failed to execute tiling.
-        Solution: 1.If the tiling or infershape function does not exsit, check whether the tiling or infershape function is registered successfully. 2.If the tiling or infershape function fails to be executed, check the implementation logic of the tiling or infershape function.
-        TraceBack (most recent call last):
-        In the attenmask compression, please set the atten_mask_shape to [2048,2048].[FUNC:AnalyzeOptionalInput][FILE:flash_attention_score_tiling_general.cpp][LINE:1688]
-        fail to analyze context info.[FUNC:GetShapeAttrsInfo][FILE:flash_attention_score_tiling_general.cpp][LINE:899]
-        Failed to execute operator OpName:[aclnnFlashAttentionScore_505_FlashAttentionScore] . Reason: Failed to execute tiling.
-        Kernel GetWorkspace failed. opType: 6
-        FlashAttentionScore launch kernel failed.
-        the l0FlashAttentionScoreOuts[0] cannot be nullptr
-
-[2] shape=(128,8,1024,256, causal=True) match=False score=0.000 baseline_avg_us=n/a candidate_avg_us=n/a speedup=n/a max_abs_diff=n/a error=npu_fusion_attention:../third_party/op-plugin/op_plugin/ops/opapi/FlashAttentionKernelNpuOpApi.cpp:1353 NPU function error: call aclnnFlashAttentionScore failed, error code is 161001
-[ERROR] 2026-06-18-10:22:32 (PID:252559, Device:0, RankID:-1) ERR00100 PTA call acl api failed.
-[PID: 252559] 2026-06-18-10:22:32.764.022 Execution_Error(EZ1009): Failed to execute operator OpName:[aclnnFlashAttentionScore_516_FlashAttentionScore] . Reason: Failed to execute tiling.
-        Solution: 1.If the tiling or infershape function does not exsit, check whether the tiling or infershape function is registered successfully. 2.If the tiling or infershape function fails to be executed, check the implementation logic of the tiling or infershape function.
-        TraceBack (most recent call last):
-        In the attenmask compression, please set the atten_mask_shape to [2048,2048].[FUNC:AnalyzeOptionalInput][FILE:flash_attention_score_tiling_general.cpp][LINE:1688]
-        fail to analyze context info.[FUNC:GetShapeAttrsInfo][FILE:flash_attention_score_tiling_general.cpp][LINE:899]
-        Failed to execute operator OpName:[aclnnFlashAttentionScore_516_FlashAttentionScore] . Reason: Failed to execute tiling.
-        Kernel GetWorkspace failed. opType: 6
-        FlashAttentionScore launch kernel failed.
-        the l0FlashAttentionScoreOuts[0] cannot be nullptr
-
-[3] shape=(128,8,2048,128, causal=True) match=True score=0.532 baseline_avg_us=10392.790 candidate_avg_us=195513.657 speedup=0.0532 max_abs_diff=0.000977 error=
-[4] shape=(128,8,2048,256, causal=False) match=True score=0.474 baseline_avg_us=34881.889 candidate_avg_us=736176.913 speedup=0.0474 max_abs_diff=0.000977 error=
-[5] shape=(128,8,4096,128, causal=False) match=True score=1.034 baseline_avg_us=72115.085 candidate_avg_us=697282.111 speedup=0.1034 max_abs_diff=0.000244 error=
-[6] shape=(128,8,8192,64, causal=False) match=True score=0.819 baseline_avg_us=240818.192 candidate_avg_us=2939942.211 speedup=0.0819 max_abs_diff=0.000061 error=
+[1] shape=(128,8,1024,128, causal=True) match=True score=0.303 baseline_avg_us=2979.190 candidate_avg_us=98288.857 speedup=0.0303 max_abs_diff=0.000977 error=
+[2] shape=(128,8,1024,256, causal=True) match=True score=0.487 baseline_avg_us=4901.740 candidate_avg_us=100714.167 speedup=0.0487 max_abs_diff=0.000977 error=
+[3] shape=(128,8,2048,128, causal=True) match=True score=0.553 baseline_avg_us=10869.638 candidate_avg_us=196427.640 speedup=0.0553 max_abs_diff=0.000977 error=
+[4] shape=(128,8,2048,256, causal=False) match=True score=0.472 baseline_avg_us=34917.759 candidate_avg_us=740457.286 speedup=0.0472 max_abs_diff=0.000977 error=
+[5] shape=(128,8,4096,128, causal=False) match=True score=1.027 baseline_avg_us=72153.649 candidate_avg_us=702378.801 speedup=0.1027 max_abs_diff=0.000244 error=
+[6] shape=(128,8,8192,64, causal=False) match=True score=0.818 baseline_avg_us=240662.578 candidate_avg_us=2941022.280 speedup=0.0818 max_abs_diff=0.000061 error=

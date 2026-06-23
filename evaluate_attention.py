@@ -3,6 +3,7 @@ import argparse
 import importlib.util
 import json
 import math
+import os
 import statistics
 import time
 from pathlib import Path
@@ -142,9 +143,11 @@ def _torch_attention_reference(q, k, v, causal: bool, sm_scale: float):
 
 def _candidate_attention(module, q, k, v, causal: bool, sm_scale: float):
     attention_fn = getattr(module, "attention")
-    get_tiling = getattr(module, "get_tiling")
-    bm, bn = get_tiling(q.shape[0], q.shape[1], q.shape[2], q.shape[3], causal)
-    return attention_fn(q, k, v, causal, sm_scale, bm, bn).to(q.dtype)
+    if os.environ.get("ATTENTION_EVAL_FIXED_TILING", "0") == "1":
+        get_tiling = getattr(module, "get_tiling")
+        bm, bn = get_tiling(q.shape[0], q.shape[1], q.shape[2], q.shape[3], causal)
+        return attention_fn(q, k, v, causal, sm_scale, bm, bn).to(q.dtype)
+    return attention_fn(q, k, v, causal, sm_scale).to(q.dtype)
 
 
 def _reference_attention(module, q, k, v, h: int, causal: bool, sm_scale: float):

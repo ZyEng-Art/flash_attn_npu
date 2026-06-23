@@ -24,24 +24,105 @@ DEVICE = "npu"
 RESULT_DIR_NAME = "result_dir_blockptr_persistent"
 TUNED_CONFIG_JSON = Path(__file__).resolve().with_name("flash_attention_forward_tuned.json")
 
-SUMMARY_KERNEL_COLUMNS = [
+SUMMARY_KERNEL_CORE_COLUMNS = [
     "Duration(us)",
     "Wait Time(us)",
     "Block Num",
     "Mix Block Num",
     "aicore_time(us)",
+    "aic_total_cycles",
+    "aiv_time(us)",
+    "aiv_total_cycles",
+]
+
+SUMMARY_KERNEL_PREFERRED_COLUMNS = SUMMARY_KERNEL_CORE_COLUMNS + [
     "aic_mac_ratio",
     "aic_scalar_ratio",
     "aic_mte1_ratio",
     "aic_mte2_ratio",
     "aic_fixpipe_ratio",
-    "aiv_time(us)",
     "aiv_vec_ratio",
     "aiv_scalar_ratio",
     "aiv_mte2_ratio",
     "aiv_mte3_ratio",
     "cube_utilization(%)",
+    "aic_mac_fp16_ratio",
+    "aic_mac_int8_ratio",
+    "aic_cube_fops",
+    "aiv_vec_fp32_ratio",
+    "aiv_vec_fp16_ratio",
+    "aiv_vec_int32_ratio",
+    "aiv_vec_misc_ratio",
+    "aiv_vector_fops",
+    "aic_l1_read_bw(GB/s)",
+    "aic_l1_write_bw(GB/s)",
+    "aic_main_mem_read_bw(GB/s)",
+    "aic_main_mem_write_bw(GB/s)",
+    "aic_l2_read_bw(GB/s)",
+    "aic_l2_write_bw(GB/s)",
+    "aiv_ub_read_bw(GB/s)",
+    "aiv_ub_write_bw(GB/s)",
+    "aiv_main_mem_read_bw(GB/s)",
+    "aiv_main_mem_write_bw(GB/s)",
+    "aiv_l2_read_bw(GB/s)",
+    "aiv_l2_write_bw(GB/s)",
+    "aic_l0a_read_bw(GB/s)",
+    "aic_l0a_write_bw(GB/s)",
+    "aic_l0b_read_bw(GB/s)",
+    "aic_l0b_write_bw(GB/s)",
+    "aic_l0c_read_bw_cube(GB/s)",
+    "aic_l0c_write_bw_cube(GB/s)",
+    "aiv_l0c_read_bw(GB/s)",
+    "aiv_l0c_write_bw(GB/s)",
+    "aiv_vec_bankgroup_cflt_ratio",
+    "aiv_vec_bank_cflt_ratio",
+    "aiv_vec_resc_cflt_ratio",
+    "aic_write_cache_hit",
+    "aic_write_cache_miss_allocate",
+    "aic_r0_read_cache_hit",
+    "aic_r0_read_cache_miss_allocate",
+    "aic_r1_read_cache_hit",
+    "aic_r1_read_cache_miss_allocate",
+    "aiv_write_cache_hit",
+    "aiv_write_cache_miss_allocate",
+    "aiv_r0_read_cache_hit",
+    "aiv_r0_read_cache_miss_allocate",
+    "aiv_r1_read_cache_hit",
+    "aiv_r1_read_cache_miss_allocate",
 ]
+
+SUMMARY_KERNEL_EXCLUDED_COLUMNS = {
+    "Step Id",
+    "Device_id",
+    "Model ID",
+    "Task ID",
+    "Stream ID",
+    "Name",
+    "Type",
+    "OP State",
+    "Accelerator Core",
+    "Start Time(us)",
+    "HF32 Eligible",
+    "Input Shapes",
+    "Input Data Types",
+    "Input Formats",
+    "Output Shapes",
+    "Output Data Types",
+    "Output Formats",
+    "Context ID",
+}
+
+SUMMARY_L2_PREFERRED_COLUMNS = [
+    "Hit Rate",
+    "Victim Rate",
+]
+
+SUMMARY_L2_EXCLUDED_COLUMNS = {
+    "Device_id",
+    "Stream Id",
+    "Task Id",
+    "Op Name",
+}
 
 SUMMARY_STEP_COLUMNS = [
     "Computing",
@@ -232,6 +313,23 @@ def _read_csv_rows(path):
         return list(csv.DictReader(f))
 
 
+def _ordered_columns(rows):
+    ordered = []
+    seen = set()
+    for row in rows:
+        for col in row.keys():
+            if col not in seen:
+                ordered.append(col)
+                seen.add(col)
+    return ordered
+
+
+def _prioritize_columns(columns, preferred):
+    prioritized = [col for col in preferred if col in columns]
+    prioritized.extend(col for col in columns if col not in prioritized)
+    return prioritized
+
+
 def _find_profiler_output(root):
     root = Path(root).resolve()
     if (root / "op_statistic.csv").exists():
@@ -261,12 +359,46 @@ def _summarize_kernel_details(rows, op_name):
     if op_name:
         rows = [row for row in rows if row.get("Name") == op_name or row.get("Type") == op_name]
     if not rows:
-        return {}
+        return {}, []
 
     summary = {"kernel_count": len(rows)}
-    for col in SUMMARY_KERNEL_COLUMNS:
-        summary[col] = _mean([_to_float(row.get(col)) for row in rows])
-    return summary
+    numeric_cols = []
+    for col in _ordered_columns(rows):
+        if col in SUMMARY_KERNEL_EXCLUDED_COLUMNS:
+            continue
+        values = [_to_float(row.get(col)) for row in rows]
+        if not any(value is not None for value in values):
+            continue
+        summary[col] = _mean(values)
+        numeric_cols.append(col)
+    numeric_cols = _prioritize_columns(numeric_cols, SUMMARY_KERNEL_PREFERRED_COLUMNS)
+    ordered_summary = {"kernel_count": summary["kernel_count"]}
+    for col in numeric_cols:
+        ordered_summary[col] = summary[col]
+    return ordered_summary, numeric_cols
+
+
+def _summarize_l2_cache(rows, op_name):
+    if op_name:
+        rows = [row for row in rows if row.get("Op Name") == op_name]
+    if not rows:
+        return {}, []
+
+    summary = {"l2_count": len(rows)}
+    l2_cols = []
+    for col in SUMMARY_L2_PREFERRED_COLUMNS:
+        if any(col in row for row in rows):
+            summary[col] = _mean([_to_float(row.get(col)) for row in rows])
+            l2_cols.append(col)
+    for col in _ordered_columns(rows):
+        if col in SUMMARY_L2_EXCLUDED_COLUMNS or col in l2_cols:
+            continue
+        values = [_to_float(row.get(col)) for row in rows]
+        if not any(value is not None for value in values):
+            continue
+        summary[col] = _mean(values)
+        l2_cols.append(col)
+    return summary, l2_cols
 
 
 def _summarize_step(rows):
@@ -293,6 +425,7 @@ def summarize_profile_output(root, preferred_op="_attn_fwd"):
     kernel_rows = _read_csv_rows(out_dir / "kernel_details.csv")
     step_rows = _read_csv_rows(out_dir / "step_trace_time.csv")
     api_rows = _read_csv_rows(out_dir / "api_statistic.csv")
+    l2_rows = _read_csv_rows(out_dir / "l2_cache.csv")
 
     main_op = _pick_main_op(op_rows, preferred_op)
     op_name = main_op.get("OP Type") if main_op else preferred_op
@@ -311,13 +444,18 @@ def summarize_profile_output(root, preferred_op="_attn_fwd"):
             value = main_op.get(key)
             op_summary[key] = _to_float(value) if "Type" not in key else value
 
+    kernel_summary, kernel_columns = _summarize_kernel_details(kernel_rows, op_name)
+    l2_summary, l2_columns = _summarize_l2_cache(l2_rows, op_name)
     return {
         "profiler_output": str(out_dir),
         "op_name": op_name,
         "op": op_summary,
-        "kernel": _summarize_kernel_details(kernel_rows, op_name),
+        "kernel": kernel_summary,
+        "kernel_columns": kernel_columns,
         "step": _summarize_step(step_rows),
         "api": _summarize_api(api_rows),
+        "l2": l2_summary,
+        "l2_columns": l2_columns,
     }
 
 
@@ -347,6 +485,7 @@ def write_profile_summary_files(root, summary_by_metric):
         )
 
         kernel = summary.get("kernel", {})
+        kernel_columns = summary.get("kernel_columns", [])
         lines.append(
             (
                 "kernel: duration_us={duration}, wait_us={wait}, block_num={block_num}, "
@@ -363,6 +502,15 @@ def write_profile_summary_files(root, summary_by_metric):
                 aiv_vec=_fmt(kernel.get("aiv_vec_ratio")),
             )
         )
+        extra_kernel_columns = [
+            col for col in kernel_columns
+            if col not in SUMMARY_KERNEL_CORE_COLUMNS and col not in {"Block Num", "Mix Block Num"}
+        ]
+        if extra_kernel_columns:
+            lines.append(
+                "kernel_metrics: "
+                + ", ".join(f"{col}={_fmt(kernel.get(col))}" for col in extra_kernel_columns)
+            )
 
         step = summary.get("step", {})
         lines.append(
@@ -383,6 +531,13 @@ def write_profile_summary_files(root, summary_by_metric):
                 sync_avg=_fmt(sync.get("Avg(us)")),
             )
         )
+        l2 = summary.get("l2", {})
+        l2_columns = summary.get("l2_columns", [])
+        if l2_columns:
+            lines.append(
+                "l2_cache: "
+                + ", ".join(f"{col}={_fmt(l2.get(col), 6)}" for col in l2_columns)
+            )
         lines.append("")
 
     with text_path.open("w", encoding="utf-8") as f:
@@ -405,11 +560,29 @@ def print_profile_summary(summary_by_metric):
         )
 
         kernel = summary.get("kernel", {})
+        kernel_columns = summary.get("kernel_columns", [])
         print(
             "  kernel duration/wait/block/mix: "
             f"{_fmt(kernel.get('Duration(us)'))} / {_fmt(kernel.get('Wait Time(us)'))} / "
             f"{_fmt(kernel.get('Block Num'))} / {_fmt(kernel.get('Mix Block Num'))}"
         )
+        extra_kernel_columns = [
+            col for col in kernel_columns
+            if col not in SUMMARY_KERNEL_CORE_COLUMNS and col not in {"Block Num", "Mix Block Num"}
+        ]
+        if extra_kernel_columns:
+            print(
+                "  kernel metrics: "
+                + ", ".join(f"{col}={_fmt(kernel.get(col))}" for col in extra_kernel_columns)
+            )
+
+        l2 = summary.get("l2", {})
+        l2_columns = summary.get("l2_columns", [])
+        if l2_columns:
+            print(
+                "  l2 cache: "
+                + ", ".join(f"{col}={_fmt(l2.get(col), 6)}" for col in l2_columns)
+            )
 
 
 def _resolve_requested_metric_names():
