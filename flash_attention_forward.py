@@ -21,7 +21,8 @@ import triton.language.extra.cann.extension as extension
 
 
 DEVICE = "npu"
-RESULT_DIR_NAME = "result_dir_blockptr_persistent"
+RESULT_DIR_NAME_PERSISTENT = "result_dir_blockptr_persistent"
+RESULT_DIR_NAME_AUTO_BLOCKIFY = "result_dir_blockptr_auto_blockify"
 TUNED_CONFIG_JSON = Path(__file__).resolve().with_name("flash_attention_forward_tuned.json")
 
 SUMMARY_KERNEL_CORE_COLUMNS = [
@@ -157,6 +158,7 @@ DEFAULT_FORWARD_CONFIG = {
     "BLOCK_M": 64,
     "BLOCK_N": 32,
     "persistent_blocks": 20,
+    "launch_mode": "persistent",
     "num_stages": 2,
     "enable_hivm_auto_cv_balance": True,
     "tile_mix_vector_loop": 2,
@@ -684,6 +686,10 @@ def _resolve_launch_programs(z, h, n_ctx, block_m, persistent_blocks=None):
     return min(total_tiles, persistent_blocks, max_programs)
 
 
+def _resolve_total_tiles(z, h, n_ctx, block_m):
+    return triton.cdiv(n_ctx, block_m) * z * h
+
+
 def _resolve_forward_config(z, h, n_ctx, head_dim, causal):
     config = dict(DEFAULT_FORWARD_CONFIG)
     config["BLOCK_M"], config["BLOCK_N"] = get_tiling(z, h, n_ctx, head_dim, causal)
@@ -695,6 +701,49 @@ def _resolve_forward_config(z, h, n_ctx, head_dim, causal):
     if exact is not None:
         config.update(exact)
     return config
+
+
+def _resolve_launch_mode(config=None):
+    requested = os.environ.get("ATTN_LAUNCH_MODE")
+    if requested is None and config is not None:
+        requested = config.get("launch_mode")
+    if requested is None:
+        return "persistent"
+
+    normalized = str(requested).strip().lower().replace("-", "_")
+    aliases = {
+        "persistent": "persistent",
+        "manual": "persistent",
+        "auto_blockify": "auto_blockify",
+        "autoblockify": "auto_blockify",
+        "auto": "auto_blockify",
+        "blockify": "auto_blockify",
+    }
+    if normalized not in aliases:
+        raise ValueError(f"Unsupported launch mode: {requested}")
+    return aliases[normalized]
+
+
+def _resolve_result_dir_name(config=None):
+    launch_mode = _resolve_launch_mode(config)
+    if launch_mode == "auto_blockify":
+        return RESULT_DIR_NAME_AUTO_BLOCKIFY
+    return RESULT_DIR_NAME_PERSISTENT
+
+
+def _describe_launch(config, z, h, n_ctx):
+    launch_mode = _resolve_launch_mode(config)
+    total_tiles = _resolve_total_tiles(z, h, n_ctx, config["BLOCK_M"])
+    if launch_mode == "auto_blockify":
+        launch_desc = f"logical_tiles={total_tiles}, auto_blockify=True"
+        impl_desc = "block_ptr + logical-grid + auto-blockify"
+    else:
+        launch_desc = (
+            f"launched_programs="
+            f"{_resolve_launch_programs(z, h, n_ctx, config['BLOCK_M'], config.get('persistent_blocks'))}"
+        )
+        impl_desc = "block_ptr + persistent + offline tuned fixed config"
+    return launch_mode, impl_desc, launch_desc
 
 
 @triton.jit
@@ -784,6 +833,151 @@ def _attn_fwd_inner(
 
 
 @triton.jit
+def _attn_fwd_tile(
+    Q,
+    K,
+    V,
+    M,
+    Out,
+    acc,
+    sm_scale,
+    stride_qz: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qm: tl.constexpr,
+    stride_qk: tl.constexpr,
+    stride_kz: tl.constexpr,
+    stride_kh: tl.constexpr,
+    stride_kn: tl.constexpr,
+    stride_kk: tl.constexpr,
+    stride_vz: tl.constexpr,
+    stride_vh: tl.constexpr,
+    stride_vn: tl.constexpr,
+    stride_vk: tl.constexpr,
+    stride_oz: tl.constexpr,
+    stride_oh: tl.constexpr,
+    stride_om: tl.constexpr,
+    stride_on: tl.constexpr,
+    Z: tl.constexpr,
+    H: tl.constexpr,
+    N_CTX: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    STAGE: tl.constexpr,
+    linear_tile,
+):
+    num_tiles_m = tl.cdiv(N_CTX, BLOCK_M)
+    task_hz_idx = linear_tile // num_tiles_m
+    task_m_idx = linear_tile - task_hz_idx * num_tiles_m
+    off_z = task_hz_idx // H
+    off_h = task_hz_idx % H
+    qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+
+    q_block_ptr = tl.make_block_ptr(
+        base=Q + qvk_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_qm, stride_qk),
+        offsets=(task_m_idx * BLOCK_M, 0),
+        block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0),
+    )
+    k_block_ptr = tl.make_block_ptr(
+        base=K + qvk_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_kn, stride_kk),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, HEAD_DIM),
+        order=(1, 0),
+    )
+    v_block_ptr = tl.make_block_ptr(
+        base=V + qvk_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_vn, stride_vk),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, HEAD_DIM),
+        order=(1, 0),
+    )
+    o_block_ptr = tl.make_block_ptr(
+        base=Out + qvk_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_om, stride_on),
+        offsets=(task_m_idx * BLOCK_M, 0),
+        block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    offs_m = task_m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    row_mask = offs_m < N_CTX
+    row_mask_cmp = offs_m.to(tl.float32) < N_CTX
+
+    m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
+    l_i = tl.zeros((BLOCK_M,), tl.float32) + 1.0
+
+    if HEAD_DIM < 256:
+        acc_ptr = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+    else:
+        acc_offset = (((off_z.to(tl.int64) * H + off_h.to(tl.int64)) * N_CTX + task_m_idx * BLOCK_M) * HEAD_DIM)
+        acc_ptr = acc + acc_offset
+
+    q = tl.load(q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+    if STAGE & 1:
+        acc_ptr, l_i, m_i = _attn_fwd_inner(
+            acc_ptr,
+            l_i,
+            m_i,
+            q,
+            k_block_ptr,
+            v_block_ptr,
+            task_m_idx,
+            sm_scale,
+            BLOCK_M,
+            HEAD_DIM,
+            BLOCK_N,
+            4 - STAGE,
+            offs_m,
+            offs_n,
+            row_mask_cmp,
+            N_CTX,
+            V.dtype.element_ty == tl.float8e5,
+        )
+    if STAGE & 2:
+        acc_ptr, l_i, m_i = _attn_fwd_inner(
+            acc_ptr,
+            l_i,
+            m_i,
+            q,
+            k_block_ptr,
+            v_block_ptr,
+            task_m_idx,
+            sm_scale,
+            BLOCK_M,
+            HEAD_DIM,
+            BLOCK_N,
+            2,
+            offs_m,
+            offs_n,
+            row_mask_cmp,
+            N_CTX,
+            V.dtype.element_ty == tl.float8e5,
+        )
+
+    m_i += tl.math.log(l_i)
+    if HEAD_DIM < 256:
+        accumulator = acc_ptr / l_i[:, None]
+    else:
+        row = tl.arange(0, BLOCK_M)[:, None]
+        col_head_dim = tl.arange(0, HEAD_DIM)[None, :]
+        accumulator = tl.load(acc_ptr + row * HEAD_DIM + col_head_dim)
+        accumulator = accumulator / l_i[:, None]
+
+    m_ptrs = M + task_hz_idx * N_CTX + offs_m
+    tl.store(m_ptrs, m_i.to(tl.float32), mask=row_mask)
+    tl.store(o_block_ptr, accumulator.to(Out.type.element_ty), boundary_check=(0, 1))
+
+
+@triton.jit
 def _attn_fwd_manual(
     Q,
     K,
@@ -822,116 +1016,108 @@ def _attn_fwd_manual(
     program_count = tl.num_programs(0)
 
     for linear_tile in tl.range(pid, total_tiles, program_count):
-        task_hz_idx = linear_tile // num_tiles_m
-        task_m_idx = linear_tile - task_hz_idx * num_tiles_m
-        off_z = task_hz_idx // H
-        off_h = task_hz_idx % H
-        qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
-
-        q_block_ptr = tl.make_block_ptr(
-            base=Q + qvk_offset,
-            shape=(N_CTX, HEAD_DIM),
-            strides=(stride_qm, stride_qk),
-            offsets=(task_m_idx * BLOCK_M, 0),
-            block_shape=(BLOCK_M, HEAD_DIM),
-            order=(1, 0),
-        )
-        k_block_ptr = tl.make_block_ptr(
-            base=K + qvk_offset,
-            shape=(N_CTX, HEAD_DIM),
-            strides=(stride_kn, stride_kk),
-            offsets=(0, 0),
-            block_shape=(BLOCK_N, HEAD_DIM),
-            order=(1, 0),
-        )
-        v_block_ptr = tl.make_block_ptr(
-            base=V + qvk_offset,
-            shape=(N_CTX, HEAD_DIM),
-            strides=(stride_vn, stride_vk),
-            offsets=(0, 0),
-            block_shape=(BLOCK_N, HEAD_DIM),
-            order=(1, 0),
-        )
-        o_block_ptr = tl.make_block_ptr(
-            base=Out + qvk_offset,
-            shape=(N_CTX, HEAD_DIM),
-            strides=(stride_om, stride_on),
-            offsets=(task_m_idx * BLOCK_M, 0),
-            block_shape=(BLOCK_M, HEAD_DIM),
-            order=(1, 0),
+        _attn_fwd_tile(
+            Q,
+            K,
+            V,
+            M,
+            Out,
+            acc,
+            sm_scale,
+            stride_qz,
+            stride_qh,
+            stride_qm,
+            stride_qk,
+            stride_kz,
+            stride_kh,
+            stride_kn,
+            stride_kk,
+            stride_vz,
+            stride_vh,
+            stride_vn,
+            stride_vk,
+            stride_oz,
+            stride_oh,
+            stride_om,
+            stride_on,
+            Z,
+            H,
+            N_CTX,
+            HEAD_DIM,
+            BLOCK_M,
+            BLOCK_N,
+            STAGE,
+            linear_tile,
         )
 
-        offs_m = task_m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n = tl.arange(0, BLOCK_N)
-        row_mask = offs_m < N_CTX
-        row_mask_cmp = offs_m.to(tl.float32) < N_CTX
 
-        m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
-        l_i = tl.zeros((BLOCK_M,), tl.float32) + 1.0
-
-        if HEAD_DIM < 256:
-            acc_ptr = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
-        else:
-            acc_offset = (
-                ((off_z.to(tl.int64) * H + off_h.to(tl.int64)) * N_CTX + task_m_idx * BLOCK_M) * HEAD_DIM
-            )
-            acc_ptr = acc + acc_offset
-
-        q = tl.load(q_block_ptr, boundary_check=(0, 1), padding_option="zero")
-
-        if STAGE & 1:
-            acc_ptr, l_i, m_i = _attn_fwd_inner(
-                acc_ptr,
-                l_i,
-                m_i,
-                q,
-                k_block_ptr,
-                v_block_ptr,
-                task_m_idx,
-                sm_scale,
-                BLOCK_M,
-                HEAD_DIM,
-                BLOCK_N,
-                4 - STAGE,
-                offs_m,
-                offs_n,
-                row_mask_cmp,
-                N_CTX,
-                V.dtype.element_ty == tl.float8e5,
-            )
-        if STAGE & 2:
-            acc_ptr, l_i, m_i = _attn_fwd_inner(
-                acc_ptr,
-                l_i,
-                m_i,
-                q,
-                k_block_ptr,
-                v_block_ptr,
-                task_m_idx,
-                sm_scale,
-                BLOCK_M,
-                HEAD_DIM,
-                BLOCK_N,
-                2,
-                offs_m,
-                offs_n,
-                row_mask_cmp,
-                N_CTX,
-                V.dtype.element_ty == tl.float8e5,
-            )
-
-        m_i += tl.math.log(l_i)
-        if HEAD_DIM < 256:
-            accumulator = acc_ptr / l_i[:, None]
-        else:
-            row = tl.arange(0, BLOCK_M)[:, None]
-            col_head_dim = tl.arange(0, HEAD_DIM)[None, :]
-            accumulator = tl.load(acc_ptr + row * HEAD_DIM + col_head_dim)
-            accumulator = accumulator / l_i[:, None]
-
-        m_ptrs = M + task_hz_idx * N_CTX + offs_m
-        tl.store(m_ptrs, m_i.to(tl.float32), mask=row_mask)
-        tl.store(o_block_ptr, accumulator.to(Out.type.element_ty), boundary_check=(0, 1))
+@triton.jit
+def _attn_fwd_auto_blockify(
+    Q,
+    K,
+    V,
+    M,
+    Out,
+    acc,
+    sm_scale,
+    stride_qz: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qm: tl.constexpr,
+    stride_qk: tl.constexpr,
+    stride_kz: tl.constexpr,
+    stride_kh: tl.constexpr,
+    stride_kn: tl.constexpr,
+    stride_kk: tl.constexpr,
+    stride_vz: tl.constexpr,
+    stride_vh: tl.constexpr,
+    stride_vn: tl.constexpr,
+    stride_vk: tl.constexpr,
+    stride_oz: tl.constexpr,
+    stride_oh: tl.constexpr,
+    stride_om: tl.constexpr,
+    stride_on: tl.constexpr,
+    Z: tl.constexpr,
+    H: tl.constexpr,
+    N_CTX: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    STAGE: tl.constexpr,
+):
+    linear_tile = tl.program_id(0)
+    _attn_fwd_tile(
+        Q,
+        K,
+        V,
+        M,
+        Out,
+        acc,
+        sm_scale,
+        stride_qz,
+        stride_qh,
+        stride_qm,
+        stride_qk,
+        stride_kz,
+        stride_kh,
+        stride_kn,
+        stride_kk,
+        stride_vz,
+        stride_vh,
+        stride_vn,
+        stride_vk,
+        stride_oz,
+        stride_oh,
+        stride_om,
+        stride_on,
+        Z,
+        H,
+        N_CTX,
+        HEAD_DIM,
+        BLOCK_M,
+        BLOCK_N,
+        STAGE,
+        linear_tile,
+    )
 
 
 @triton.jit
@@ -1024,7 +1210,14 @@ def _launch_kernel(kernel, q, k, v, causal, sm_scale, config):
         else torch.zeros((z, h, n_ctx, head_dim), dtype=torch.float32, device=q.device)
     )
 
-    grid = (_resolve_launch_programs(z, h, n_ctx, config["BLOCK_M"], config.get("persistent_blocks")), 1, 1)
+    launch_mode = _resolve_launch_mode(config)
+    total_tiles = _resolve_total_tiles(z, h, n_ctx, config["BLOCK_M"])
+    if launch_mode == "auto_blockify":
+        grid = (total_tiles, 1, 1)
+        auto_blockify_size = config.get("auto_blockify_size") or config.get("persistent_blocks") or 1
+    else:
+        grid = (_resolve_launch_programs(z, h, n_ctx, config["BLOCK_M"], config.get("persistent_blocks")), 1, 1)
+        auto_blockify_size = 1
     stage = 3 if causal else 1
 
     kernel[grid](
@@ -1063,30 +1256,35 @@ def _launch_kernel(kernel, q, k, v, causal, sm_scale, config):
         tile_mix_vector_loop=config["tile_mix_vector_loop"],
         tile_mix_cube_loop=config["tile_mix_cube_loop"],
         enable_ubuf_saving=config["enable_ubuf_saving"],
+        auto_blockify_size=auto_blockify_size,
         debug=False,
     )
     return out, lse
 
 
-def _launch_attention(q, k, v, causal, sm_scale, bm, bn):
+def _launch_attention(q, k, v, causal, sm_scale, bm, bn, launch_mode=None):
     config = dict(DEFAULT_FORWARD_CONFIG)
     config["BLOCK_M"] = bm
     config["BLOCK_N"] = bn
-    return _launch_kernel(_attn_fwd, q, k, v, causal, sm_scale, config)
+    if launch_mode is not None:
+        config["launch_mode"] = launch_mode
+    kernel = _attn_fwd_auto_blockify if _resolve_launch_mode(config) == "auto_blockify" else _attn_fwd
+    return _launch_kernel(kernel, q, k, v, causal, sm_scale, config)
 
 
 def _launch_attention_forward(q, k, v, causal, sm_scale):
     config = _resolve_forward_config(q.shape[0], q.shape[1], q.shape[2], q.shape[3], causal)
-    return _launch_kernel(_attn_fwd, q, k, v, causal, sm_scale, config)
+    kernel = _attn_fwd_auto_blockify if _resolve_launch_mode(config) == "auto_blockify" else _attn_fwd
+    return _launch_kernel(kernel, q, k, v, causal, sm_scale, config)
 
 
 def profile_once(z, h, n_ctx, head_dim, causal, dtype, q, k, v, sm_scale):
     config = _resolve_forward_config(z, h, n_ctx, head_dim, causal)
-    launched_programs = _resolve_launch_programs(z, h, n_ctx, config["BLOCK_M"], config.get("persistent_blocks"))
-    print("Triton implementation: block_ptr + persistent + offline tuned fixed config")
+    _, impl_desc, launch_desc = _describe_launch(config, z, h, n_ctx)
+    print(f"Triton implementation: {impl_desc}")
     print(
         "Triton launch config: "
-        f"BM={config['BLOCK_M']}, BN={config['BLOCK_N']}, launched_programs={launched_programs}"
+        f"BM={config['BLOCK_M']}, BN={config['BLOCK_N']}, {launch_desc}"
     )
     print(f"Selected forward config: {config}")
     torch.npu.synchronize()
@@ -1095,15 +1293,15 @@ def profile_once(z, h, n_ctx, head_dim, causal, dtype, q, k, v, sm_scale):
 
 def profiling(z, h, n_ctx, head_dim, causal, dtype, q, k, v, sm_scale):
     config = _resolve_forward_config(z, h, n_ctx, head_dim, causal)
-    launched_programs = _resolve_launch_programs(z, h, n_ctx, config["BLOCK_M"], config.get("persistent_blocks"))
-    print("Triton implementation: block_ptr + persistent + offline tuned fixed config")
+    _, impl_desc, launch_desc = _describe_launch(config, z, h, n_ctx)
+    print(f"Triton implementation: {impl_desc}")
     print(
         "Triton launch config: "
-        f"BM={config['BLOCK_M']}, BN={config['BLOCK_N']}, launched_programs={launched_programs}"
+        f"BM={config['BLOCK_M']}, BN={config['BLOCK_N']}, {launch_desc}"
     )
     print(f"Selected forward config: {config}")
 
-    result_dir = Path.cwd() / RESULT_DIR_NAME
+    result_dir = Path.cwd() / _resolve_result_dir_name(config)
     if result_dir.exists():
         shutil.rmtree(result_dir)
 
@@ -1145,7 +1343,22 @@ def profiling(z, h, n_ctx, head_dim, causal, dtype, q, k, v, sm_scale):
 
 
 def attention_persistent(q, k, v, causal, sm_scale, bm, bn, return_lse=False):
-    out, lse = _launch_attention(q, k, v, causal, sm_scale, bm, bn)
+    out, lse = _launch_attention(q, k, v, causal, sm_scale, bm, bn, launch_mode="persistent")
+    if return_lse:
+        return out, lse
+    return out
+
+
+def attention_auto_blockify(q, k, v, causal, sm_scale, bm, bn, return_lse=False):
+    old_parallel = os.environ.get("TRITON_ALL_BLOCKS_PARALLEL")
+    os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = "1"
+    try:
+        out, lse = _launch_attention(q, k, v, causal, sm_scale, bm, bn, launch_mode="auto_blockify")
+    finally:
+        if old_parallel is None:
+            os.environ.pop("TRITON_ALL_BLOCKS_PARALLEL", None)
+        else:
+            os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = old_parallel
     if return_lse:
         return out, lse
     return out
@@ -1178,6 +1391,12 @@ def _make_inputs(z, h, n_ctx, head_dim, dtype):
 
 
 def _apply_runtime_overrides(args):
+    if getattr(args, "launch_mode", None):
+        os.environ["ATTN_LAUNCH_MODE"] = args.launch_mode
+        if args.launch_mode == "auto_blockify":
+            os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = "1"
+        else:
+            os.environ.pop("TRITON_ALL_BLOCKS_PARALLEL", None)
     if getattr(args, "profile_metrics", None):
         os.environ["PROFILE_METRICS"] = args.profile_metrics
     if getattr(args, "override_bm", None) is not None:
@@ -1221,6 +1440,7 @@ def _build_cli():
         subparser.add_argument("--causal", action="store_true")
         subparser.add_argument("--dtype", default="float16", choices=["float16", "fp16", "bfloat16", "bf16"])
         subparser.add_argument("--sm-scale", type=float, default=0.5, dest="sm_scale")
+        subparser.add_argument("--launch-mode", choices=["persistent", "auto_blockify"], default=None)
         subparser.add_argument("--profile-metrics")
         subparser.add_argument("--override-bm", type=int)
         subparser.add_argument("--override-bn", type=int)
@@ -1256,10 +1476,12 @@ def main():
 
 __all__ = [
     "DEVICE",
-    "RESULT_DIR_NAME",
+    "RESULT_DIR_NAME_PERSISTENT",
+    "RESULT_DIR_NAME_AUTO_BLOCKIFY",
     "DEFAULT_FORWARD_CONFIG",
     "TUNED_CONFIGS",
     "attention",
+    "attention_auto_blockify",
     "attention_persistent",
     "get_tiling",
     "profile_once",
@@ -1267,6 +1489,7 @@ __all__ = [
     "summarize_profile_output",
     "write_profile_summary_files",
     "_attn_fwd",
+    "_attn_fwd_auto_blockify",
     "_attn_fwd_manual",
 ]
 
