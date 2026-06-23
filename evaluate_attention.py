@@ -47,7 +47,9 @@ DEFAULT_SM_SCALE = 0.5
 DEFAULT_ATOL = 1e-2
 DEFAULT_RTOL = 1e-2
 DEFAULT_WARMUP = 5
-DEFAULT_ITERS = 20
+DEFAULT_ITERS = 30
+DEFAULT_SPEED_METRIC = "median_us"
+DEFAULT_TRIM_RATIO = 0.1
 
 
 def _load_candidate_module(module_path: Path):
@@ -181,6 +183,100 @@ def _measure_us(fn, warmup: int, iters: int):
     }
 
 
+def _quantile_from_sorted(sorted_values, q: float):
+    if not sorted_values:
+        return None
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    position = (len(sorted_values) - 1) * q
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return float(sorted_values[lower])
+    lower_value = sorted_values[lower]
+    upper_value = sorted_values[upper]
+    fraction = position - lower
+    return float(lower_value + (upper_value - lower_value) * fraction)
+
+
+def _trimmed_mean(sorted_values, trim_ratio: float):
+    if not sorted_values:
+        return None
+    trim_count = min(int(len(sorted_values) * trim_ratio), max((len(sorted_values) - 1) // 2, 0))
+    trimmed = sorted_values[trim_count : len(sorted_values) - trim_count] if trim_count else sorted_values
+    return float(statistics.mean(trimmed))
+
+
+def _summarize_samples(times_us, trim_ratio: float):
+    if not times_us:
+        return None
+    sorted_times = sorted(float(sample) for sample in times_us)
+    avg_us = float(statistics.mean(sorted_times))
+    median_us = float(statistics.median(sorted_times))
+    min_us = float(sorted_times[0])
+    max_us = float(sorted_times[-1])
+    stdev_us = float(statistics.pstdev(sorted_times)) if len(sorted_times) > 1 else 0.0
+    p10_us = _quantile_from_sorted(sorted_times, 0.10)
+    p90_us = _quantile_from_sorted(sorted_times, 0.90)
+    trimmed_avg_us = _trimmed_mean(sorted_times, trim_ratio)
+    cv = (stdev_us / avg_us) if avg_us else None
+    return {
+        "avg_us": avg_us,
+        "median_us": median_us,
+        "trimmed_avg_us": trimmed_avg_us,
+        "min_us": min_us,
+        "max_us": max_us,
+        "stddev_us": stdev_us,
+        "cv": cv,
+        "p10_us": p10_us,
+        "p90_us": p90_us,
+        "samples_us": sorted_times,
+    }
+
+
+def _measure_pair_us(baseline_fn, candidate_fn, warmup: int, iters: int, trim_ratio: float):
+    for _ in range(warmup):
+        baseline_fn()
+        candidate_fn()
+    torch.npu.synchronize()
+
+    baseline_samples = []
+    candidate_samples = []
+    baseline_out = None
+    candidate_out = None
+    for idx in range(iters):
+        order = ("baseline", "candidate") if idx % 2 == 0 else ("candidate", "baseline")
+        for name in order:
+            start = time.perf_counter()
+            if name == "baseline":
+                baseline_out = baseline_fn()
+                torch.npu.synchronize()
+                baseline_samples.append((time.perf_counter() - start) * 1e6)
+            else:
+                candidate_out = candidate_fn()
+                torch.npu.synchronize()
+                candidate_samples.append((time.perf_counter() - start) * 1e6)
+
+    baseline_stats = _summarize_samples(baseline_samples, trim_ratio)
+    candidate_stats = _summarize_samples(candidate_samples, trim_ratio)
+    if baseline_stats is not None:
+        baseline_stats["iters"] = iters
+        baseline_stats["warmup"] = warmup
+    if candidate_stats is not None:
+        candidate_stats["iters"] = iters
+        candidate_stats["warmup"] = warmup
+    return baseline_out, candidate_out, baseline_stats, candidate_stats
+
+
+def _metric_value(stats: dict | None, metric_name: str):
+    if not stats:
+        return None
+    value = stats.get(metric_name)
+    if value is None and metric_name == "median_us":
+        value = stats.get("avg_us")
+    return value
+
+
 def _safe_speedup(baseline_us, candidate_us):
     if baseline_us is None or candidate_us is None:
         return None
@@ -234,7 +330,7 @@ def run_correctness_case(module, device, dtype, shape, sm_scale, seed, atol, rto
 
 
 @torch.no_grad()
-def run_performance_case(module, device, dtype, shape, sm_scale, seed, atol, rtol, warmup, iters):
+def run_performance_case(module, device, dtype, shape, sm_scale, seed, atol, rtol, warmup, iters, speed_metric, trim_ratio):
     z, h, n_ctx, head_dim, causal = shape
     q, k, v = _make_inputs(device, dtype, z, h, n_ctx, head_dim, seed)
 
@@ -253,17 +349,16 @@ def run_performance_case(module, device, dtype, shape, sm_scale, seed, atol, rto
         output_match = torch.allclose(ref_out, tri_out, atol=atol, rtol=rtol)
 
         if output_match:
-            _, baseline_stats = _measure_us(
+            _, _, baseline_stats, candidate_stats = _measure_pair_us(
                 lambda: _baseline_attention(q, k, v, h, causal, sm_scale),
-                warmup,
-                iters,
-            )
-            _, candidate_stats = _measure_us(
                 lambda: _candidate_attention(module, q, k, v, causal, sm_scale),
                 warmup,
                 iters,
+                trim_ratio,
             )
-            speedup = _safe_speedup(baseline_stats["avg_us"], candidate_stats["avg_us"])
+            baseline_metric_us = _metric_value(baseline_stats, speed_metric)
+            candidate_metric_us = _metric_value(candidate_stats, speed_metric)
+            speedup = _safe_speedup(baseline_metric_us, candidate_metric_us)
             if speedup is not None:
                 points = _performance_case_points() * min(max(speedup, 0.0), 1.0)
     except Exception as exc:  # noqa: BLE001
@@ -279,6 +374,7 @@ def run_performance_case(module, device, dtype, shape, sm_scale, seed, atol, rto
         "max_abs_diff": max_abs_diff,
         "baseline": baseline_stats,
         "candidate": candidate_stats,
+        "speed_metric": speed_metric,
         "speedup": speedup,
         "score": points,
         "error": error,
@@ -313,6 +409,7 @@ def _summarize_performance(results):
         "score": score,
         "max_score": PERFORMANCE_TOTAL_POINTS,
         "mean_speedup": statistics.mean(valid_speedups) if valid_speedups else None,
+        "median_speedup": statistics.median(valid_speedups) if valid_speedups else None,
         "cases": results,
     }
 
@@ -342,6 +439,14 @@ def _write_reports(report_root: Path, summary: dict):
     lines.append("==================")
     lines.append(f"candidate_module={summary['config']['candidate_module']}")
     lines.append(f"dtype={summary['config']['dtype']}, sm_scale={summary['config']['sm_scale']}")
+    lines.append(
+        "performance_metric={metric}, trim_ratio={trim_ratio}, warmup={warmup}, iters={iters}".format(
+            metric=summary["config"]["speed_metric"],
+            trim_ratio=summary["config"]["trim_ratio"],
+            warmup=summary["config"]["warmup"],
+            iters=summary["config"]["iters"],
+        )
+    )
     lines.append(
         "correctness_score={correctness} / {correctness_max}, performance_score={performance} / {performance_max}, total_score={total} / 100".format(
             correctness=_format_float(summary["correctness"]["score"]),
@@ -375,10 +480,12 @@ def _write_reports(report_root: Path, summary: dict):
     lines.append("Performance Cases")
     lines.append("-----------------")
     for idx, case in enumerate(summary["performance"]["cases"], start=1):
-        baseline_avg = case["baseline"]["avg_us"] if case["baseline"] else None
-        candidate_avg = case["candidate"]["avg_us"] if case["candidate"] else None
+        baseline_metric = _metric_value(case["baseline"], case["speed_metric"])
+        candidate_metric = _metric_value(case["candidate"], case["speed_metric"])
+        baseline_cv = case["baseline"]["cv"] if case["baseline"] else None
+        candidate_cv = case["candidate"]["cv"] if case["candidate"] else None
         lines.append(
-            "[{idx}] shape=({Z},{H},{N_CTX},{HEAD_DIM}, causal={causal}) match={output_match} score={score} baseline_avg_us={baseline} candidate_avg_us={candidate} speedup={speedup} max_abs_diff={diff} error={error}".format(
+            "[{idx}] shape=({Z},{H},{N_CTX},{HEAD_DIM}, causal={causal}) match={output_match} score={score} baseline_{metric}={baseline} candidate_{metric}={candidate} speedup={speedup} baseline_cv={baseline_cv} candidate_cv={candidate_cv} max_abs_diff={diff} error={error}".format(
                 idx=idx,
                 Z=case["Z"],
                 H=case["H"],
@@ -386,9 +493,12 @@ def _write_reports(report_root: Path, summary: dict):
                 HEAD_DIM=case["HEAD_DIM"],
                 causal=case["causal"],
                 output_match=case["output_match"],
-                baseline=_format_float(baseline_avg),
-                candidate=_format_float(candidate_avg),
+                metric=case["speed_metric"],
+                baseline=_format_float(baseline_metric),
+                candidate=_format_float(candidate_metric),
                 speedup=_format_float(case["speedup"], precision=4),
+                baseline_cv=_format_float(baseline_cv, precision=4),
+                candidate_cv=_format_float(candidate_cv, precision=4),
                 score=_format_float(case["score"]),
                 diff=_format_float(case["max_abs_diff"], precision=6),
                 error=case["error"] or "",
@@ -448,6 +558,18 @@ def build_arg_parser():
     parser.add_argument("--iters", type=int, default=DEFAULT_ITERS)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--speed-metric",
+        choices=["avg_us", "median_us", "trimmed_avg_us", "min_us"],
+        default=DEFAULT_SPEED_METRIC,
+        help="Statistic used for performance scoring. median_us is more stable on jittery devices.",
+    )
+    parser.add_argument(
+        "--trim-ratio",
+        type=float,
+        default=DEFAULT_TRIM_RATIO,
+        help="Trim ratio used when computing trimmed_avg_us.",
+    )
+    parser.add_argument(
         "--report-dir",
         default=str(Path(__file__).resolve().with_name("evaluation_reports")),
         help="Directory where reports are written.",
@@ -498,6 +620,8 @@ def main(argv=None):
                     args.rtol,
                     args.warmup,
                     args.iters,
+                    args.speed_metric,
+                    args.trim_ratio,
                 )
             )
 
@@ -516,12 +640,14 @@ def main(argv=None):
             "warmup": args.warmup,
             "iters": args.iters,
             "seed": args.seed,
+            "speed_metric": args.speed_metric,
+            "trim_ratio": args.trim_ratio,
             "scoring": {
                 "correctness_total": CORRECTNESS_TOTAL_POINTS,
                 "performance_total": PERFORMANCE_TOTAL_POINTS,
                 "correctness_points_per_case": _correctness_case_points(),
                 "performance_points_per_case": _performance_case_points(),
-                "performance_formula": "per_case_score = 10 * min(baseline_avg_us / candidate_avg_us, 1.0) when output matches",
+                "performance_formula": "per_case_score = 10 * min(baseline_<metric>_us / candidate_<metric>_us, 1.0) when output matches",
             },
         },
         "correctness": correctness_summary,
