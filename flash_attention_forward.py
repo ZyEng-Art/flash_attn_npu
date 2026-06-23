@@ -757,7 +757,6 @@ def _attn_fwd_inner(
 
         p = tl.math.exp(qk)
         p_cast = p.to(tl.float8e5) if fp8_v else p.to(k.dtype)
-        pv = tl.dot(p_cast, v)
         l_ij = tl.sum(p, axis=1)
         alpha = tl.math.exp(m_i - m_ij)
         l_i = l_i * alpha + l_ij
@@ -766,6 +765,7 @@ def _attn_fwd_inner(
             acc_ptr = acc_ptr * alpha[:, None]
             acc_ptr = tl.dot(p_cast, v, acc_ptr)
         else:
+            pv = tl.dot(p_cast, v)
             acc = tl.load(acc_ptr + block2d_acc)
             for slice_idx in range(4):
                 offset = slice_idx * (BLOCK_M // 4)
