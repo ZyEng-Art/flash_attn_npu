@@ -68,6 +68,25 @@ def _shape_record(shape):
     }
 
 
+def _shape_key_string_from_record(record):
+    return f"{record['Z']}:{record['H']}:{record['N_CTX']}:{record['HEAD_DIM']}:{int(record['causal'])}"
+
+
+def _parse_shape_arg(raw: str):
+    parts = [part.strip() for part in str(raw).split(",")]
+    if len(parts) != 5:
+        raise ValueError("shape must be formatted as 'Z,H,N_CTX,HEAD_DIM,causal'")
+    z, h, n_ctx, head_dim = (int(value) for value in parts[:4])
+    causal_raw = parts[4].lower()
+    if causal_raw in {"1", "true", "t", "yes", "y"}:
+        causal = True
+    elif causal_raw in {"0", "false", "f", "no", "n"}:
+        causal = False
+    else:
+        raise ValueError(f"invalid causal flag: {parts[4]}")
+    return (z, h, n_ctx, head_dim, causal)
+
+
 def _resolve_programs(z: int, h: int, n_ctx: int, block_m: int, persistent_blocks: int, max_programs: int = 65535):
     total_tiles = ((n_ctx + block_m - 1) // block_m) * z * h
     launched_programs = min(total_tiles, persistent_blocks, max_programs)
@@ -211,6 +230,41 @@ def _baseline_attention(eval_module, q, k, v, h: int, causal: bool, sm_scale: fl
     return eval_module._baseline_attention(q, k, v, h, causal, sm_scale)
 
 
+def _merge_with_existing_output(output_path: Path, payload: dict):
+    if not output_path.exists():
+        return payload
+
+    try:
+        existing = json.loads(output_path.read_text(encoding="utf-8"))
+    except Exception:
+        return payload
+
+    merged_configs = dict(existing.get("tuned_configs", {}))
+    merged_configs.update(payload.get("tuned_configs", {}))
+
+    merged_results = {}
+    ordered_keys = []
+    for item in existing.get("results", []):
+        if not isinstance(item, dict):
+            continue
+        key = _shape_key_string_from_record(item)
+        if key not in ordered_keys:
+            ordered_keys.append(key)
+        merged_results[key] = item
+    for item in payload.get("results", []):
+        if not isinstance(item, dict):
+            continue
+        key = _shape_key_string_from_record(item)
+        if key not in ordered_keys:
+            ordered_keys.append(key)
+        merged_results[key] = item
+
+    merged_payload = dict(payload)
+    merged_payload["tuned_configs"] = merged_configs
+    merged_payload["results"] = [merged_results[key] for key in ordered_keys]
+    return merged_payload
+
+
 @torch.no_grad()
 def tune_case(module, eval_module, shape, dtype, sm_scale: float, seed: int, top_tilings: int, top_configs: int,
               stage_a_iters: int, stage_b_iters: int, stage_c_iters: int, final_iters: int):
@@ -336,12 +390,26 @@ def main():
     parser.add_argument("--stage-b-iters", type=int, default=DEFAULT_STAGE_B_ITERS)
     parser.add_argument("--stage-c-iters", type=int, default=DEFAULT_STAGE_C_ITERS)
     parser.add_argument("--final-iters", type=int, default=DEFAULT_FINAL_ITERS)
+    parser.add_argument(
+        "--replace-output",
+        action="store_true",
+        help="Overwrite output JSON instead of merging new shapes into an existing file.",
+    )
+    parser.add_argument(
+        "--shape",
+        action="append",
+        help="Optional shape override formatted as 'Z,H,N_CTX,HEAD_DIM,causal'. May be passed multiple times.",
+    )
     args = parser.parse_args()
 
     dtype = torch.float16
     candidate_module = _load_module(Path(args.candidate_module), "flash_attention_candidate")
     evaluate_module = _load_module(Path(args.evaluate_module), "flash_attention_evaluate")
-    performance_cases = list(evaluate_module.PERFORMANCE_CASES)
+    performance_cases = (
+        [_parse_shape_arg(raw_shape) for raw_shape in args.shape]
+        if args.shape
+        else list(evaluate_module.PERFORMANCE_CASES)
+    )
 
     results = []
     for idx, shape in enumerate(performance_cases, start=1):
@@ -387,6 +455,8 @@ def main():
     }
 
     output_path = Path(args.output_json)
+    if not args.replace_output:
+        payload = _merge_with_existing_output(output_path, payload)
     output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
     print(f"Tuned config JSON written to: {output_path}")
 
