@@ -1,13 +1,12 @@
 """
-Pure-Triton Flash Attention forward for Ascend NPU.
+Simple single-path Flash Attention forward for Ascend NPU.
 
-This module keeps the forward kernel, launch config selection, and lightweight
-profiling helpers used by the workspace scripts.
+This module keeps one persistent Triton kernel, a small manual autotune space,
+and detailed torch_npu profiling summaries.
 """
 
 import argparse
 import csv
-import json
 import os
 import shutil
 from pathlib import Path
@@ -21,9 +20,9 @@ import triton.language.extra.cann.extension as extension
 
 
 DEVICE = "npu"
-RESULT_DIR_NAME_PERSISTENT = "result_dir_blockptr_persistent"
-RESULT_DIR_NAME_AUTO_BLOCKIFY = "result_dir_blockptr_auto_blockify"
-TUNED_CONFIG_JSON = Path(__file__).resolve().with_name("flash_attention_forward_tuned.json")
+RESULT_DIR_NAME = "result_dir_autotune"
+DEFAULT_PERSISTENT_PROGRAMS = 20
+AUTO_TUNE_PROFILE_DIR = os.environ.get("AUTO_TUNE_PROFILE_DIR")
 
 SUMMARY_KERNEL_CORE_COLUMNS = [
     "Duration(us)",
@@ -154,130 +153,59 @@ DEFAULT_AIC_METRIC_CANDIDATES = [
     "L2Cache",
 ]
 
-DEFAULT_FORWARD_CONFIG = {
-    "BLOCK_M": 64,
-    "BLOCK_N": 32,
-    "persistent_blocks": 20,
-    "launch_mode": "persistent",
-    "num_stages": 2,
-    "enable_hivm_auto_cv_balance": True,
-    "tile_mix_vector_loop": 2,
-    "tile_mix_cube_loop": 2,
-    "enable_ubuf_saving": True,
+AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}),
+]
+
+# BEGIN AUTO-TUNED DEFAULT TILING PRESETS
+# Default tiling presets captured from offline tuning.
+# This block is rewritten by `tune_flash_attention_forward.py`.
+DEFAULT_TILING_PRESETS = {
+    (128, 8, 1024, 128, True): (128, 64),
+    (128, 8, 1024, 256, True): (64, 64),
+    (128, 8, 2048, 128, True): (128, 64),
+    (128, 8, 2048, 256, False): (64, 64),
+    (128, 8, 4096, 128, False): (128, 128),
+    (128, 8, 8192, 64, False): (128, 128),
 }
-
-BUILTIN_TUNED_CONFIGS = {
-    (128, 8, 1024, 128, True): {
-        "BLOCK_M": 64,
-        "BLOCK_N": 64,
-        "persistent_blocks": 20,
-        "num_stages": 2,
-        "enable_hivm_auto_cv_balance": False,
-        "tile_mix_vector_loop": 2,
-        "tile_mix_cube_loop": 2,
-        "enable_ubuf_saving": True,
-    },
-    (128, 8, 1024, 256, True): {
-        "BLOCK_M": 64,
-        "BLOCK_N": 64,
-        "persistent_blocks": 20,
-        "num_stages": 1,
-        "enable_hivm_auto_cv_balance": False,
-        "tile_mix_vector_loop": 2,
-        "tile_mix_cube_loop": 4,
-        "enable_ubuf_saving": True,
-    },
-    (128, 8, 2048, 128, True): {
-        "BLOCK_M": 64,
-        "BLOCK_N": 64,
-        "persistent_blocks": 20,
-        "num_stages": 2,
-        "enable_hivm_auto_cv_balance": False,
-        "tile_mix_vector_loop": 2,
-        "tile_mix_cube_loop": 2,
-        "enable_ubuf_saving": True,
-    },
-    (128, 8, 2048, 256, False): {
-        "BLOCK_M": 64,
-        "BLOCK_N": 64,
-        "persistent_blocks": 20,
-        "num_stages": 1,
-        "enable_hivm_auto_cv_balance": True,
-        "tile_mix_vector_loop": 2,
-        "tile_mix_cube_loop": 4,
-        "enable_ubuf_saving": True,
-    },
-    (128, 8, 4096, 128, False): {
-        "BLOCK_M": 64,
-        "BLOCK_N": 64,
-        "persistent_blocks": 16,
-        "num_stages": 1,
-        "enable_hivm_auto_cv_balance": False,
-        "tile_mix_vector_loop": 4,
-        "tile_mix_cube_loop": 4,
-        "enable_ubuf_saving": True,
-    },
-    (128, 8, 8192, 64, False): {
-        "BLOCK_M": 64,
-        "BLOCK_N": 64,
-        "persistent_blocks": 16,
-        "num_stages": 2,
-        "enable_hivm_auto_cv_balance": False,
-        "tile_mix_vector_loop": 2,
-        "tile_mix_cube_loop": 2,
-        "enable_ubuf_saving": True,
-    },
-}
-
-TILING_HINTS = {
-    (1, 1, 64, 64, False): (64, 16),
-    (1, 1, 64, 64, True): (64, 16),
-    (1, 1, 128, 128, False): (32, 32),
-    (1, 1, 128, 128, True): (32, 32),
-    (1, 2, 1024, 64, False): (64, 32),
-    (1, 2, 1024, 64, True): (64, 32),
-    (4, 32, 64, 64, False): (64, 32),
-    (4, 32, 64, 64, True): (64, 32),
-    (4, 32, 128, 128, False): (32, 64),
-    (4, 32, 256, 128, True): (64, 64),
-    (4, 32, 512, 64, True): (64, 64),
-    (4, 32, 1024, 64, False): (64, 64),
-    (4, 32, 1024, 64, True): (64, 64),
-    (4, 32, 1024, 128, False): (32, 32),
-    (4, 32, 2048, 64, True): (64, 64),
-    (4, 32, 2048, 128, False): (32, 32),
-    (4, 32, 4096, 64, False): (64, 64),
-    (128, 8, 1024, 64, False): (64, 64),
-    (128, 8, 1024, 128, True): (32, 32),
-    (128, 8, 1024, 256, True): (32, 32),
-    (128, 8, 2048, 128, True): (64, 32),
-    (128, 8, 2048, 256, False): (32, 32),
-    (128, 8, 4096, 128, False): (64, 64),
-    (128, 8, 8192, 64, False): (128, 32),
-}
+# END AUTO-TUNED DEFAULT TILING PRESETS
 
 
-def _parse_shape_key(raw_key):
-    z, h, n_ctx, head_dim, causal = raw_key.split(":")
-    return int(z), int(h), int(n_ctx), int(head_dim), bool(int(causal))
+def _default_tiling(z, h, n_ctx, head_dim, causal):
+    preset = DEFAULT_TILING_PRESETS.get((z, h, n_ctx, head_dim, causal))
+    if preset is not None:
+        return preset
+
+    if causal:
+        if head_dim >= 128:
+            return (64, 32) if n_ctx >= 2048 else (32, 32)
+        if n_ctx >= 8192:
+            return 128, 32
+        return 64, 32
+
+    if head_dim >= 256:
+        return 32, 32
+    if head_dim >= 128:
+        return (64, 32) if n_ctx >= 2048 else (32, 32)
+    if n_ctx >= 8192:
+        return 128, 32
+    if n_ctx >= 2048:
+        return 64, 64
+    if n_ctx >= 1024:
+        return (64, 64) if head_dim <= 64 else (64, 32)
+    return (64, 32) if head_dim <= 64 else (32, 32)
 
 
-def _load_tuned_configs():
-    configs = dict(BUILTIN_TUNED_CONFIGS)
-    if not TUNED_CONFIG_JSON.exists():
-        return configs
-
-    try:
-        payload = json.loads(TUNED_CONFIG_JSON.read_text(encoding="utf-8"))
-    except Exception:
-        return configs
-
-    for raw_key, config in payload.get("tuned_configs", {}).items():
-        configs[_parse_shape_key(raw_key)] = dict(config)
-    return configs
-
-
-TUNED_CONFIGS = _load_tuned_configs()
+def get_tiling(z, h, n_ctx, head_dim, causal):
+    best_config = _get_best_config()
+    if best_config is not None:
+        return best_config["BLOCK_M"], best_config["BLOCK_N"]
+    return _default_tiling(z, h, n_ctx, head_dim, causal)
 
 
 def _to_float(value):
@@ -466,6 +394,8 @@ def write_profile_summary_files(root, summary_by_metric):
     json_path = root / "profile_summary.json"
     text_path = root / "profile_summary.txt"
 
+    import json
+
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(summary_by_metric, f, indent=2, ensure_ascii=True)
 
@@ -639,111 +569,41 @@ def _make_experimental_config(aic_metric):
     )
 
 
-def get_tiling(z, h, n_ctx, head_dim, causal):
-    override_bm = os.environ.get("OVERRIDE_BM")
-    override_bn = os.environ.get("OVERRIDE_BN")
-    if override_bm and override_bn:
-        return int(override_bm), int(override_bn)
-
-    exact = TILING_HINTS.get((z, h, n_ctx, head_dim, causal))
-    if exact is not None:
-        return exact
-
-    if causal:
-        if head_dim >= 128:
-            return (64, 32) if n_ctx >= 2048 else (32, 32)
-        if n_ctx >= 8192:
-            return 128, 32
-        return 64, 32
-
-    if head_dim >= 256:
-        return 32, 32
-    if head_dim >= 128:
-        return (64, 32) if n_ctx >= 2048 else (32, 32)
-    if n_ctx >= 8192:
-        return 128, 32
-    if n_ctx >= 2048:
-        return 64, 64
-    if n_ctx >= 1024:
-        return (64, 64) if head_dim <= 64 else (64, 32)
-    return (64, 32) if head_dim <= 64 else (32, 32)
+def _get_persistent_programs():
+    raw = os.environ.get("PERSISTENT_PROGRAMS")
+    if raw is None:
+        return DEFAULT_PERSISTENT_PROGRAMS
+    value = int(raw)
+    if value < 1:
+        raise ValueError("PERSISTENT_PROGRAMS must be >= 1")
+    return value
 
 
-def _resolve_launch_programs(z, h, n_ctx, block_m, persistent_blocks=None):
-    total_tiles = triton.cdiv(n_ctx, block_m) * z * h
-    max_programs = int(os.environ.get("MAX_LAUNCHED_PROGRAMS", "65535"))
-    if max_programs < 1:
-        raise ValueError("MAX_LAUNCHED_PROGRAMS must be >= 1")
-
-    requested = os.environ.get("PERSISTENT_BLOCKS")
-    if requested is not None:
-        persistent_blocks = int(requested)
-    elif persistent_blocks is None:
-        persistent_blocks = int(os.environ.get("DEFAULT_LAUNCHED_PROGRAMS", "20"))
-
-    if persistent_blocks < 1:
-        raise ValueError("persistent block count must be >= 1")
-    return min(total_tiles, persistent_blocks, max_programs)
+def _get_best_config():
+    config = getattr(_attn_fwd, "best_config", None)
+    if config is None:
+        return None
+    return dict(config.kwargs)
 
 
-def _resolve_total_tiles(z, h, n_ctx, block_m):
-    return triton.cdiv(n_ctx, block_m) * z * h
+def _describe_runtime(z, h, n_ctx, causal):
+    best_config = _get_best_config()
+    if best_config is None:
+        return {
+            "best_config": None,
+            "total_tiles": None,
+            "launched_programs": None,
+            "stage": 3 if causal else 1,
+        }
 
-
-def _resolve_forward_config(z, h, n_ctx, head_dim, causal):
-    config = dict(DEFAULT_FORWARD_CONFIG)
-    config["BLOCK_M"], config["BLOCK_N"] = get_tiling(z, h, n_ctx, head_dim, causal)
-
-    if os.environ.get("OVERRIDE_BM") and os.environ.get("OVERRIDE_BN"):
-        return config
-
-    exact = TUNED_CONFIGS.get((z, h, n_ctx, head_dim, causal))
-    if exact is not None:
-        config.update(exact)
-    return config
-
-
-def _resolve_launch_mode(config=None):
-    requested = os.environ.get("ATTN_LAUNCH_MODE")
-    if requested is None and config is not None:
-        requested = config.get("launch_mode")
-    if requested is None:
-        return "persistent"
-
-    normalized = str(requested).strip().lower().replace("-", "_")
-    aliases = {
-        "persistent": "persistent",
-        "manual": "persistent",
-        "auto_blockify": "auto_blockify",
-        "autoblockify": "auto_blockify",
-        "auto": "auto_blockify",
-        "blockify": "auto_blockify",
+    total_tiles = triton.cdiv(n_ctx, best_config["BLOCK_M"]) * z * h
+    launched_programs = min(total_tiles, _get_persistent_programs())
+    return {
+        "best_config": best_config,
+        "total_tiles": total_tiles,
+        "launched_programs": launched_programs,
+        "stage": 3 if causal else 1,
     }
-    if normalized not in aliases:
-        raise ValueError(f"Unsupported launch mode: {requested}")
-    return aliases[normalized]
-
-
-def _resolve_result_dir_name(config=None):
-    launch_mode = _resolve_launch_mode(config)
-    if launch_mode == "auto_blockify":
-        return RESULT_DIR_NAME_AUTO_BLOCKIFY
-    return RESULT_DIR_NAME_PERSISTENT
-
-
-def _describe_launch(config, z, h, n_ctx):
-    launch_mode = _resolve_launch_mode(config)
-    total_tiles = _resolve_total_tiles(z, h, n_ctx, config["BLOCK_M"])
-    if launch_mode == "auto_blockify":
-        launch_desc = f"logical_tiles={total_tiles}, auto_blockify=True"
-        impl_desc = "block_ptr + logical-grid + auto-blockify"
-    else:
-        launch_desc = (
-            f"launched_programs="
-            f"{_resolve_launch_programs(z, h, n_ctx, config['BLOCK_M'], config.get('persistent_blocks'))}"
-        )
-        impl_desc = "block_ptr + persistent + offline tuned fixed config"
-    return launch_mode, impl_desc, launch_desc
 
 
 @triton.jit
@@ -1205,8 +1065,13 @@ def _attn_fwd_tile(
         tl.store(o_block_ptr, accumulator.to(Out.type.element_ty), boundary_check=(0, 1))
 
 
+@triton.autotune(
+    configs=AUTOTUNE_CONFIGS,
+    key=["Z", "H", "N_CTX", "HEAD_DIM", "STAGE"],
+    auto_prof_dir=AUTO_TUNE_PROFILE_DIR,
+)
 @triton.jit
-def _attn_fwd_manual(
+def _attn_fwd(
     Q,
     K,
     V,
@@ -1280,7 +1145,7 @@ def _attn_fwd_manual(
 
 
 @triton.jit
-def _attn_fwd_auto_blockify(
+def _attn_fwd_fixed(
     Q,
     K,
     V,
@@ -1312,107 +1177,45 @@ def _attn_fwd_auto_blockify(
     BLOCK_N: tl.constexpr,
     STAGE: tl.constexpr,
 ):
-    linear_tile = tl.program_id(0)
-    _attn_fwd_tile(
-        Q,
-        K,
-        V,
-        M,
-        Out,
-        acc,
-        sm_scale,
-        stride_qz,
-        stride_qh,
-        stride_qm,
-        stride_qk,
-        stride_kz,
-        stride_kh,
-        stride_kn,
-        stride_kk,
-        stride_vz,
-        stride_vh,
-        stride_vn,
-        stride_vk,
-        stride_oz,
-        stride_oh,
-        stride_om,
-        stride_on,
-        Z,
-        H,
-        N_CTX,
-        HEAD_DIM,
-        BLOCK_M,
-        BLOCK_N,
-        STAGE,
-        linear_tile,
-    )
+    num_tiles_m = tl.cdiv(N_CTX, BLOCK_M)
+    total_tiles = num_tiles_m * Z * H
+    pid = tl.program_id(0)
+    program_count = tl.num_programs(0)
 
-
-@triton.jit
-def _attn_fwd(
-    Q,
-    K,
-    V,
-    M,
-    Out,
-    acc,
-    sm_scale,
-    stride_qz: tl.constexpr,
-    stride_qh: tl.constexpr,
-    stride_qm: tl.constexpr,
-    stride_qk: tl.constexpr,
-    stride_kz: tl.constexpr,
-    stride_kh: tl.constexpr,
-    stride_kn: tl.constexpr,
-    stride_kk: tl.constexpr,
-    stride_vz: tl.constexpr,
-    stride_vh: tl.constexpr,
-    stride_vn: tl.constexpr,
-    stride_vk: tl.constexpr,
-    stride_oz: tl.constexpr,
-    stride_oh: tl.constexpr,
-    stride_om: tl.constexpr,
-    stride_on: tl.constexpr,
-    Z: tl.constexpr,
-    H: tl.constexpr,
-    N_CTX: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    STAGE: tl.constexpr,
-):
-    _attn_fwd_manual(
-        Q,
-        K,
-        V,
-        M,
-        Out,
-        acc,
-        sm_scale,
-        stride_qz,
-        stride_qh,
-        stride_qm,
-        stride_qk,
-        stride_kz,
-        stride_kh,
-        stride_kn,
-        stride_kk,
-        stride_vz,
-        stride_vh,
-        stride_vn,
-        stride_vk,
-        stride_oz,
-        stride_oh,
-        stride_om,
-        stride_on,
-        Z,
-        H,
-        N_CTX,
-        HEAD_DIM,
-        BLOCK_M,
-        BLOCK_N,
-        STAGE,
-    )
+    for linear_tile in tl.range(pid, total_tiles, program_count):
+        _attn_fwd_tile(
+            Q,
+            K,
+            V,
+            M,
+            Out,
+            acc,
+            sm_scale,
+            stride_qz,
+            stride_qh,
+            stride_qm,
+            stride_qk,
+            stride_kz,
+            stride_kh,
+            stride_kn,
+            stride_kk,
+            stride_vz,
+            stride_vh,
+            stride_vn,
+            stride_vk,
+            stride_oz,
+            stride_oh,
+            stride_om,
+            stride_on,
+            Z,
+            H,
+            N_CTX,
+            HEAD_DIM,
+            BLOCK_M,
+            BLOCK_N,
+            STAGE,
+            linear_tile,
+        )
 
 
 def _validate_inputs(q, k, v):
@@ -1426,7 +1229,15 @@ def _validate_inputs(q, k, v):
         raise ValueError("HEAD_DIM must be one of {16, 32, 64, 128, 256}")
 
 
-def _launch_kernel(kernel, q, k, v, causal, sm_scale, config):
+def _build_grid(z, h, n_ctx):
+    def grid(meta):
+        total_tiles = triton.cdiv(n_ctx, meta["BLOCK_M"]) * z * h
+        return (min(total_tiles, _get_persistent_programs()), 1, 1)
+
+    return grid
+
+
+def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None):
     _validate_inputs(q, k, v)
 
     z, h, n_ctx, head_dim = q.shape
@@ -1437,16 +1248,19 @@ def _launch_kernel(kernel, q, k, v, causal, sm_scale, config):
         if head_dim < 256
         else torch.zeros((z, h, n_ctx, head_dim), dtype=torch.float32, device=q.device)
     )
-
-    launch_mode = _resolve_launch_mode(config)
-    total_tiles = _resolve_total_tiles(z, h, n_ctx, config["BLOCK_M"])
-    if launch_mode == "auto_blockify":
-        grid = (total_tiles, 1, 1)
-        auto_blockify_size = config.get("auto_blockify_size") or config.get("persistent_blocks") or 1
-    else:
-        grid = (_resolve_launch_programs(z, h, n_ctx, config["BLOCK_M"], config.get("persistent_blocks")), 1, 1)
-        auto_blockify_size = 1
     stage = 3 if causal else 1
+
+    if (bm is None) != (bn is None):
+        raise ValueError("BM and BN must be provided together")
+
+    kernel = _attn_fwd
+    grid = _build_grid(z, h, n_ctx)
+    meta_kwargs = {
+        "N_CTX": n_ctx,
+        "HEAD_DIM": head_dim,
+        "STAGE": stage,
+        "debug": False,
+    }
 
     kernel[grid](
         q,
@@ -1474,62 +1288,45 @@ def _launch_kernel(kernel, q, k, v, causal, sm_scale, config):
         out.stride(3),
         z,
         h,
-        N_CTX=n_ctx,
-        HEAD_DIM=head_dim,
-        BLOCK_M=config["BLOCK_M"],
-        BLOCK_N=config["BLOCK_N"],
-        STAGE=stage,
-        num_stages=config["num_stages"],
-        enable_hivm_auto_cv_balance=config["enable_hivm_auto_cv_balance"],
-        tile_mix_vector_loop=config["tile_mix_vector_loop"],
-        tile_mix_cube_loop=config["tile_mix_cube_loop"],
-        enable_ubuf_saving=config["enable_ubuf_saving"],
-        auto_blockify_size=auto_blockify_size,
-        debug=False,
+        **meta_kwargs,
     )
     return out, lse
 
 
-def _launch_attention(q, k, v, causal, sm_scale, bm, bn, launch_mode=None):
-    config = dict(DEFAULT_FORWARD_CONFIG)
-    config["BLOCK_M"] = bm
-    config["BLOCK_N"] = bn
-    if launch_mode is not None:
-        config["launch_mode"] = launch_mode
-    kernel = _attn_fwd_auto_blockify if _resolve_launch_mode(config) == "auto_blockify" else _attn_fwd
-    return _launch_kernel(kernel, q, k, v, causal, sm_scale, config)
+def attention(q, k, v, causal, sm_scale, BM=None, BN=None, return_lse=False):
+    out, lse = _launch_kernel(q, k, v, causal, sm_scale, bm=BM, bn=BN)
+    if return_lse:
+        return out, lse
+    return out
 
 
-def _launch_attention_forward(q, k, v, causal, sm_scale):
-    config = _resolve_forward_config(q.shape[0], q.shape[1], q.shape[2], q.shape[3], causal)
-    kernel = _attn_fwd_auto_blockify if _resolve_launch_mode(config) == "auto_blockify" else _attn_fwd
-    return _launch_kernel(kernel, q, k, v, causal, sm_scale, config)
-
-
-def profile_once(z, h, n_ctx, head_dim, causal, dtype, q, k, v, sm_scale):
-    config = _resolve_forward_config(z, h, n_ctx, head_dim, causal)
-    _, impl_desc, launch_desc = _describe_launch(config, z, h, n_ctx)
-    print(f"Triton implementation: {impl_desc}")
-    print(
-        "Triton launch config: "
-        f"BM={config['BLOCK_M']}, BN={config['BLOCK_N']}, {launch_desc}"
-    )
-    print(f"Selected forward config: {config}")
+def profile_once(z, h, n_ctx, head_dim, causal, q, k, v, sm_scale):
+    out = attention(q, k, v, causal, sm_scale)
     torch.npu.synchronize()
-    return attention(q, k, v, causal, sm_scale).to(dtype)
-
-
-def profiling(z, h, n_ctx, head_dim, causal, dtype, q, k, v, sm_scale):
-    config = _resolve_forward_config(z, h, n_ctx, head_dim, causal)
-    _, impl_desc, launch_desc = _describe_launch(config, z, h, n_ctx)
-    print(f"Triton implementation: {impl_desc}")
+    runtime = _describe_runtime(z, h, n_ctx, causal)
+    print("Triton implementation: single persistent autotuned kernel")
+    print(f"Selected autotune config: {runtime['best_config']}")
     print(
-        "Triton launch config: "
-        f"BM={config['BLOCK_M']}, BN={config['BLOCK_N']}, {launch_desc}"
+        "Launch summary: "
+        f"stage={runtime['stage']}, total_tiles={runtime['total_tiles']}, "
+        f"launched_programs={runtime['launched_programs']}"
     )
-    print(f"Selected forward config: {config}")
+    return out
 
-    result_dir = Path.cwd() / _resolve_result_dir_name(config)
+
+def profiling(z, h, n_ctx, head_dim, causal, q, k, v, sm_scale):
+    attention(q, k, v, causal, sm_scale)
+    torch.npu.synchronize()
+    runtime = _describe_runtime(z, h, n_ctx, causal)
+    print("Triton implementation: single persistent autotuned kernel")
+    print(f"Selected autotune config: {runtime['best_config']}")
+    print(
+        "Launch summary: "
+        f"stage={runtime['stage']}, total_tiles={runtime['total_tiles']}, "
+        f"launched_programs={runtime['launched_programs']}"
+    )
+
+    result_dir = Path.cwd() / RESULT_DIR_NAME
     if result_dir.exists():
         shutil.rmtree(result_dir)
 
@@ -1556,7 +1353,7 @@ def profiling(z, h, n_ctx, head_dim, causal, dtype, q, k, v, sm_scale):
             experimental_config=_make_experimental_config(metric_value),
         ) as prof:
             for _ in range(total_steps):
-                attention(q, k, v, causal, sm_scale).to(dtype)
+                attention(q, k, v, causal, sm_scale)
                 torch.npu.synchronize()
                 prof.step()
 
@@ -1568,38 +1365,6 @@ def profiling(z, h, n_ctx, head_dim, causal, dtype, q, k, v, sm_scale):
     print("Text summary:", summary_txt)
     print_profile_summary(summary_by_metric)
     return summary_by_metric
-
-
-def attention_persistent(q, k, v, causal, sm_scale, bm, bn, return_lse=False):
-    out, lse = _launch_attention(q, k, v, causal, sm_scale, bm, bn, launch_mode="persistent")
-    if return_lse:
-        return out, lse
-    return out
-
-
-def attention_auto_blockify(q, k, v, causal, sm_scale, bm, bn, return_lse=False):
-    old_parallel = os.environ.get("TRITON_ALL_BLOCKS_PARALLEL")
-    os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = "1"
-    try:
-        out, lse = _launch_attention(q, k, v, causal, sm_scale, bm, bn, launch_mode="auto_blockify")
-    finally:
-        if old_parallel is None:
-            os.environ.pop("TRITON_ALL_BLOCKS_PARALLEL", None)
-        else:
-            os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = old_parallel
-    if return_lse:
-        return out, lse
-    return out
-
-
-def attention(q, k, v, causal, sm_scale, BM=None, BN=None, return_lse=False):
-    if BM is None or BN is None:
-        out, lse = _launch_attention_forward(q, k, v, causal, sm_scale)
-    else:
-        out, lse = _launch_attention(q, k, v, causal, sm_scale, BM, BN)
-    if return_lse:
-        return out, lse
-    return out
 
 
 def _dtype_from_name(name):
@@ -1619,20 +1384,21 @@ def _make_inputs(z, h, n_ctx, head_dim, dtype):
 
 
 def _apply_runtime_overrides(args):
-    if getattr(args, "launch_mode", None):
-        os.environ["ATTN_LAUNCH_MODE"] = args.launch_mode
-        if args.launch_mode == "auto_blockify":
-            os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = "1"
-        else:
-            os.environ.pop("TRITON_ALL_BLOCKS_PARALLEL", None)
     if getattr(args, "profile_metrics", None):
         os.environ["PROFILE_METRICS"] = args.profile_metrics
-    if getattr(args, "override_bm", None) is not None:
-        os.environ["OVERRIDE_BM"] = str(args.override_bm)
-    if getattr(args, "override_bn", None) is not None:
-        os.environ["OVERRIDE_BN"] = str(args.override_bn)
-    if getattr(args, "persistent_blocks", None) is not None:
-        os.environ["PERSISTENT_BLOCKS"] = str(args.persistent_blocks)
+    if getattr(args, "autotune_use_profiler", False):
+        os.environ["TRITON_BENCH_METHOD"] = "npu"
+    if getattr(args, "print_autotuning", False):
+        os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
+    if getattr(args, "persistent_programs", None) is not None:
+        os.environ["PERSISTENT_PROGRAMS"] = str(args.persistent_programs)
+
+
+def _run_tune(args):
+    dtype = _dtype_from_name(args.dtype)
+    _apply_runtime_overrides(args)
+    q, k, v = _make_inputs(args.z, args.h, args.n_ctx, args.head_dim, dtype)
+    profile_once(args.z, args.h, args.n_ctx, args.head_dim, args.causal, q, k, v, args.sm_scale)
 
 
 def _run_bench(args):
@@ -1648,19 +1414,22 @@ def _run_bench(args):
         attention(q, k, v, args.causal, args.sm_scale)
     torch.npu.synchronize()
 
+    runtime = _describe_runtime(args.z, args.h, args.n_ctx, args.causal)
+    print(f"Selected autotune config: {runtime['best_config']}")
+
 
 def _run_torch_profile(args):
     dtype = _dtype_from_name(args.dtype)
     _apply_runtime_overrides(args)
     q, k, v = _make_inputs(args.z, args.h, args.n_ctx, args.head_dim, dtype)
-    profiling(args.z, args.h, args.n_ctx, args.head_dim, args.causal, dtype, q, k, v, args.sm_scale)
+    profiling(args.z, args.h, args.n_ctx, args.head_dim, args.causal, q, k, v, args.sm_scale)
 
 
 def _build_cli():
-    parser = argparse.ArgumentParser(description="Flash attention forward kernel and profiling entrypoints.")
+    parser = argparse.ArgumentParser(description="Simple Flash Attention forward with autotune and profiling.")
     subparsers = parser.add_subparsers(dest="command")
 
-    def add_shape_args(subparser):
+    def add_common_args(subparser):
         subparser.add_argument("--z", type=int, required=True)
         subparser.add_argument("--h", type=int, required=True)
         subparser.add_argument("--n-ctx", type=int, required=True, dest="n_ctx")
@@ -1668,29 +1437,32 @@ def _build_cli():
         subparser.add_argument("--causal", action="store_true")
         subparser.add_argument("--dtype", default="float16", choices=["float16", "fp16", "bfloat16", "bf16"])
         subparser.add_argument("--sm-scale", type=float, default=0.5, dest="sm_scale")
-        subparser.add_argument("--launch-mode", choices=["persistent", "auto_blockify"], default=None)
-        subparser.add_argument("--profile-metrics")
-        subparser.add_argument("--override-bm", type=int)
-        subparser.add_argument("--override-bn", type=int)
-        subparser.add_argument("--persistent-blocks", type=int)
+        subparser.add_argument("--autotune-use-profiler", action="store_true")
+        subparser.add_argument("--print-autotuning", action="store_true")
+        subparser.add_argument("--persistent-programs", type=int)
+
+    tune = subparsers.add_parser("tune")
+    add_common_args(tune)
+    tune.set_defaults(handler=_run_tune)
 
     bench = subparsers.add_parser("bench")
-    add_shape_args(bench)
+    add_common_args(bench)
     bench.add_argument("--warmup", type=int, default=5)
     bench.add_argument("--iters", type=int, default=20)
     bench.set_defaults(handler=_run_bench)
 
     torch_profile = subparsers.add_parser("torch-profile")
-    add_shape_args(torch_profile)
+    add_common_args(torch_profile)
+    torch_profile.add_argument("--profile-metrics")
     torch_profile.set_defaults(handler=_run_torch_profile)
     return parser
 
 
 def _run_default_profile():
-    z, h, n_ctx, head_dim = 128, 8, 8192, 64
+    z, h, n_ctx, head_dim = 2, 8, 1024, 128
     causal, dtype = False, torch.float16
     q, k, v = _make_inputs(z, h, n_ctx, head_dim, dtype)
-    profiling(z, h, n_ctx, head_dim, causal, dtype, q, k, v, sm_scale=0.5)
+    profiling(z, h, n_ctx, head_dim, causal, q, k, v, sm_scale=0.5)
 
 
 def main():
@@ -1704,21 +1476,14 @@ def main():
 
 __all__ = [
     "DEVICE",
-    "RESULT_DIR_NAME_PERSISTENT",
-    "RESULT_DIR_NAME_AUTO_BLOCKIFY",
-    "DEFAULT_FORWARD_CONFIG",
-    "TUNED_CONFIGS",
+    "RESULT_DIR_NAME",
+    "AUTOTUNE_CONFIGS",
     "attention",
-    "attention_auto_blockify",
-    "attention_persistent",
-    "get_tiling",
     "profile_once",
     "profiling",
     "summarize_profile_output",
     "write_profile_summary_files",
     "_attn_fwd",
-    "_attn_fwd_auto_blockify",
-    "_attn_fwd_manual",
 ]
 
 
