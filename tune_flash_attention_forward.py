@@ -6,10 +6,6 @@ import statistics
 import time
 from pathlib import Path
 
-import torch
-import torch_npu  # noqa: F401
-
-
 DEFAULT_SM_SCALE = 0.5
 DEFAULT_SEED = 0
 DEFAULT_TUNE_ITERS = 3
@@ -29,6 +25,8 @@ TILING_CANDIDATES = [
 
 PRESET_BEGIN = "# BEGIN AUTO-TUNED DEFAULT TILING PRESETS"
 PRESET_END = "# END AUTO-TUNED DEFAULT TILING PRESETS"
+
+torch = None
 
 
 def _load_module(module_path: Path, name: str):
@@ -211,7 +209,6 @@ def _merge_with_existing_output(output_path: Path, payload: dict):
     return merged_payload
 
 
-@torch.no_grad()
 def tune_case(module, eval_module, shape, dtype, sm_scale: float, seed: int, tune_iters: int, final_iters: int):
     z, h, n_ctx, head_dim, causal = shape
     q, k, v = _make_inputs(module.DEVICE, dtype, z, h, n_ctx, head_dim, seed)
@@ -314,6 +311,18 @@ def apply_tuned_presets(candidate_module_path: Path, tuned_json_path: Path):
     candidate_module_path.write_text(updated, encoding="utf-8")
 
 
+def _ensure_torch_runtime():
+    global torch
+    if torch is not None:
+        return torch
+
+    import torch as _torch
+    import torch_npu  # noqa: F401
+
+    torch = _torch
+    return torch
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Offline tune flash_attention_forward.py and optionally apply tuned tiling presets."
@@ -368,7 +377,8 @@ def main():
         print(f"Applied tuned presets from {output_json_path} to {candidate_module_path}")
         return
 
-    dtype = torch.float16
+    torch_runtime = _ensure_torch_runtime()
+    dtype = torch_runtime.float16
     candidate_module = _load_module(candidate_module_path, "flash_attention_candidate")
     evaluate_module = _load_module(Path(args.evaluate_module).resolve(), "flash_attention_evaluate")
     performance_cases = (

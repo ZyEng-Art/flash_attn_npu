@@ -1,7 +1,7 @@
 """
 Simple single-path Flash Attention forward for Ascend NPU.
 
-This module keeps one persistent Triton kernel, a small manual autotune space,
+This module uses one persistent Triton kernel with offline-tuned tiling presets
 and detailed torch_npu profiling summaries.
 """
 
@@ -20,9 +20,9 @@ import triton.language.extra.cann.extension as extension
 
 
 DEVICE = "npu"
-RESULT_DIR_NAME = "result_dir_autotune"
+RESULT_DIR_NAME = "result_dir"
 DEFAULT_PERSISTENT_PROGRAMS = 20
-AUTO_TUNE_PROFILE_DIR = os.environ.get("AUTO_TUNE_PROFILE_DIR")
+PROFILE_OP_NAME = "_attn_fwd"
 
 SUMMARY_KERNEL_CORE_COLUMNS = [
     "Duration(us)",
@@ -153,15 +153,6 @@ DEFAULT_AIC_METRIC_CANDIDATES = [
     "L2Cache",
 ]
 
-AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}),
-]
-
 # BEGIN AUTO-TUNED DEFAULT TILING PRESETS
 # Default tiling presets captured from offline tuning.
 # This block is rewritten by `tune_flash_attention_forward.py`.
@@ -202,10 +193,13 @@ def _default_tiling(z, h, n_ctx, head_dim, causal):
 
 
 def get_tiling(z, h, n_ctx, head_dim, causal):
-    best_config = _get_best_config()
-    if best_config is not None:
-        return best_config["BLOCK_M"], best_config["BLOCK_N"]
     return _default_tiling(z, h, n_ctx, head_dim, causal)
+
+
+def get_tiling_source(z, h, n_ctx, head_dim, causal):
+    if (z, h, n_ctx, head_dim, causal) in DEFAULT_TILING_PRESETS:
+        return "preset"
+    return "fallback"
 
 
 def _to_float(value):
@@ -276,7 +270,7 @@ def _find_profiler_output(root):
     raise FileNotFoundError(f"cannot find op_statistic.csv under {root}")
 
 
-def _pick_main_op(rows, preferred_op="_attn_fwd"):
+def _pick_main_op(rows, preferred_op=PROFILE_OP_NAME):
     if not rows:
         return None
     matches = [row for row in rows if row.get("OP Type") == preferred_op]
@@ -349,7 +343,7 @@ def _summarize_api(rows):
     return summary
 
 
-def summarize_profile_output(root, preferred_op="_attn_fwd"):
+def summarize_profile_output(root, preferred_op=PROFILE_OP_NAME):
     out_dir = _find_profiler_output(root)
     op_rows = _read_csv_rows(out_dir / "op_statistic.csv")
     kernel_rows = _read_csv_rows(out_dir / "kernel_details.csv")
@@ -579,27 +573,21 @@ def _get_persistent_programs():
     return value
 
 
-def _get_best_config():
-    config = getattr(_attn_fwd, "best_config", None)
-    if config is None:
-        return None
-    return dict(config.kwargs)
+def _resolve_tiling(z, h, n_ctx, head_dim, causal, bm=None, bn=None):
+    if (bm is None) != (bn is None):
+        raise ValueError("BM and BN must be provided together")
+    if bm is not None:
+        return bm, bn, "override"
+    return (*get_tiling(z, h, n_ctx, head_dim, causal), get_tiling_source(z, h, n_ctx, head_dim, causal))
 
 
-def _describe_runtime(z, h, n_ctx, causal):
-    best_config = _get_best_config()
-    if best_config is None:
-        return {
-            "best_config": None,
-            "total_tiles": None,
-            "launched_programs": None,
-            "stage": 3 if causal else 1,
-        }
-
-    total_tiles = triton.cdiv(n_ctx, best_config["BLOCK_M"]) * z * h
+def _describe_runtime(z, h, n_ctx, head_dim, causal, bm=None, bn=None):
+    block_m, block_n, tiling_source = _resolve_tiling(z, h, n_ctx, head_dim, causal, bm, bn)
+    total_tiles = triton.cdiv(n_ctx, block_m) * z * h
     launched_programs = min(total_tiles, _get_persistent_programs())
     return {
-        "best_config": best_config,
+        "selected_config": {"BLOCK_M": block_m, "BLOCK_N": block_n},
+        "tiling_source": tiling_source,
         "total_tiles": total_tiles,
         "launched_programs": launched_programs,
         "stage": 3 if causal else 1,
@@ -1065,87 +1053,8 @@ def _attn_fwd_tile(
         tl.store(o_block_ptr, accumulator.to(Out.type.element_ty), boundary_check=(0, 1))
 
 
-@triton.autotune(
-    configs=AUTOTUNE_CONFIGS,
-    key=["Z", "H", "N_CTX", "HEAD_DIM", "STAGE"],
-    auto_prof_dir=AUTO_TUNE_PROFILE_DIR,
-)
 @triton.jit
 def _attn_fwd(
-    Q,
-    K,
-    V,
-    M,
-    Out,
-    acc,
-    sm_scale,
-    stride_qz: tl.constexpr,
-    stride_qh: tl.constexpr,
-    stride_qm: tl.constexpr,
-    stride_qk: tl.constexpr,
-    stride_kz: tl.constexpr,
-    stride_kh: tl.constexpr,
-    stride_kn: tl.constexpr,
-    stride_kk: tl.constexpr,
-    stride_vz: tl.constexpr,
-    stride_vh: tl.constexpr,
-    stride_vn: tl.constexpr,
-    stride_vk: tl.constexpr,
-    stride_oz: tl.constexpr,
-    stride_oh: tl.constexpr,
-    stride_om: tl.constexpr,
-    stride_on: tl.constexpr,
-    Z: tl.constexpr,
-    H: tl.constexpr,
-    N_CTX: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    STAGE: tl.constexpr,
-):
-    num_tiles_m = tl.cdiv(N_CTX, BLOCK_M)
-    total_tiles = num_tiles_m * Z * H
-    pid = tl.program_id(0)
-    program_count = tl.num_programs(0)
-
-    for linear_tile in tl.range(pid, total_tiles, program_count):
-        _attn_fwd_tile(
-            Q,
-            K,
-            V,
-            M,
-            Out,
-            acc,
-            sm_scale,
-            stride_qz,
-            stride_qh,
-            stride_qm,
-            stride_qk,
-            stride_kz,
-            stride_kh,
-            stride_kn,
-            stride_kk,
-            stride_vz,
-            stride_vh,
-            stride_vn,
-            stride_vk,
-            stride_oz,
-            stride_oh,
-            stride_om,
-            stride_on,
-            Z,
-            H,
-            N_CTX,
-            HEAD_DIM,
-            BLOCK_M,
-            BLOCK_N,
-            STAGE,
-            linear_tile,
-        )
-
-
-@triton.jit
-def _attn_fwd_fixed(
     Q,
     K,
     V,
@@ -1229,18 +1138,16 @@ def _validate_inputs(q, k, v):
         raise ValueError("HEAD_DIM must be one of {16, 32, 64, 128, 256}")
 
 
-def _build_grid(z, h, n_ctx):
-    def grid(meta):
-        total_tiles = triton.cdiv(n_ctx, meta["BLOCK_M"]) * z * h
-        return (min(total_tiles, _get_persistent_programs()), 1, 1)
-
-    return grid
+def _build_grid(z, h, n_ctx, block_m):
+    total_tiles = triton.cdiv(n_ctx, block_m) * z * h
+    return (min(total_tiles, _get_persistent_programs()), 1, 1)
 
 
 def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None):
     _validate_inputs(q, k, v)
 
     z, h, n_ctx, head_dim = q.shape
+    bm, bn, _ = _resolve_tiling(z, h, n_ctx, head_dim, causal, bm, bn)
     out = torch.empty_like(q)
     lse = torch.empty((z, h, n_ctx), device=q.device, dtype=torch.float32)
     acc = (
@@ -1249,20 +1156,9 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None):
         else torch.zeros((z, h, n_ctx, head_dim), dtype=torch.float32, device=q.device)
     )
     stage = 3 if causal else 1
+    grid = _build_grid(z, h, n_ctx, bm)
 
-    if (bm is None) != (bn is None):
-        raise ValueError("BM and BN must be provided together")
-
-    kernel = _attn_fwd
-    grid = _build_grid(z, h, n_ctx)
-    meta_kwargs = {
-        "N_CTX": n_ctx,
-        "HEAD_DIM": head_dim,
-        "STAGE": stage,
-        "debug": False,
-    }
-
-    kernel[grid](
+    _attn_fwd[grid](
         q,
         k,
         v,
@@ -1288,7 +1184,12 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None):
         out.stride(3),
         z,
         h,
-        **meta_kwargs,
+        N_CTX=n_ctx,
+        HEAD_DIM=head_dim,
+        BLOCK_M=bm,
+        BLOCK_N=bn,
+        STAGE=stage,
+        debug=False,
     )
     return out, lse
 
@@ -1303,9 +1204,9 @@ def attention(q, k, v, causal, sm_scale, BM=None, BN=None, return_lse=False):
 def profile_once(z, h, n_ctx, head_dim, causal, q, k, v, sm_scale):
     out = attention(q, k, v, causal, sm_scale)
     torch.npu.synchronize()
-    runtime = _describe_runtime(z, h, n_ctx, causal)
-    print("Triton implementation: single persistent autotuned kernel")
-    print(f"Selected autotune config: {runtime['best_config']}")
+    runtime = _describe_runtime(z, h, n_ctx, head_dim, causal)
+    print("Triton implementation: single persistent fixed-tiling kernel")
+    print(f"Selected tiling config: {runtime['selected_config']} (source={runtime['tiling_source']})")
     print(
         "Launch summary: "
         f"stage={runtime['stage']}, total_tiles={runtime['total_tiles']}, "
@@ -1314,12 +1215,40 @@ def profile_once(z, h, n_ctx, head_dim, causal, q, k, v, sm_scale):
     return out
 
 
-def profiling(z, h, n_ctx, head_dim, causal, q, k, v, sm_scale):
+def profiling(z, h, n_ctx, head_dim, causal, *args, **kwargs):
+    sm_scale_kw = kwargs.pop("sm_scale", None)
+    if kwargs:
+        unexpected = ", ".join(sorted(kwargs))
+        raise TypeError(f"profiling() got unexpected keyword argument(s): {unexpected}")
+
+    if sm_scale_kw is None:
+        if len(args) == 4:
+            q, k, v, sm_scale = args
+        elif len(args) == 5:
+            _dtype, q, k, v, sm_scale = args
+        else:
+            raise TypeError(
+                "profiling expects either (q, k, v, sm_scale) or "
+                "(dtype, q, k, v, sm_scale) after causal"
+            )
+    else:
+        if len(args) == 3:
+            q, k, v = args
+            sm_scale = sm_scale_kw
+        elif len(args) == 4:
+            _dtype, q, k, v = args
+            sm_scale = sm_scale_kw
+        else:
+            raise TypeError(
+                "profiling expects either (q, k, v, sm_scale=<value>) or "
+                "(dtype, q, k, v, sm_scale=<value>) after causal"
+            )
+
     attention(q, k, v, causal, sm_scale)
     torch.npu.synchronize()
-    runtime = _describe_runtime(z, h, n_ctx, causal)
-    print("Triton implementation: single persistent autotuned kernel")
-    print(f"Selected autotune config: {runtime['best_config']}")
+    runtime = _describe_runtime(z, h, n_ctx, head_dim, causal)
+    print("Triton implementation: single persistent fixed-tiling kernel")
+    print(f"Selected tiling config: {runtime['selected_config']} (source={runtime['tiling_source']})")
     print(
         "Launch summary: "
         f"stage={runtime['stage']}, total_tiles={runtime['total_tiles']}, "
@@ -1337,14 +1266,14 @@ def profiling(z, h, n_ctx, head_dim, causal, q, k, v, sm_scale):
         raise RuntimeError("No available AiCMetrics found in torch_npu.profiler.AiCMetrics.")
 
     summary_by_metric = {}
-    for metric_name, metric_value in metric_plan:
-        metric_result_dir = result_dir / metric_name
+    for metric_idx, (metric_name, metric_value) in enumerate(metric_plan):
+        profile_root = result_dir if metric_idx == 0 else result_dir / metric_name
         print(f"Profiling metric: {metric_name}")
 
         with torch_npu.profiler.profile(
             activities=_build_profiler_activities(),
             schedule=torch_npu.profiler.schedule(wait=1, warmup=1, active=active, repeat=1, skip_first=1),
-            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(metric_result_dir / "triton")),
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(profile_root / "triton")),
             record_shapes=True,
             profile_memory=True,
             with_stack=False,
@@ -1357,7 +1286,7 @@ def profiling(z, h, n_ctx, head_dim, causal, q, k, v, sm_scale):
                 torch.npu.synchronize()
                 prof.step()
 
-        summary_by_metric[metric_name] = summarize_profile_output(metric_result_dir, preferred_op="_attn_fwd")
+        summary_by_metric[metric_name] = summarize_profile_output(profile_root, preferred_op=PROFILE_OP_NAME)
 
     summary_json, summary_txt = write_profile_summary_files(result_dir, summary_by_metric)
     print("Profiling complete. Results saved to:", result_dir)
@@ -1386,10 +1315,6 @@ def _make_inputs(z, h, n_ctx, head_dim, dtype):
 def _apply_runtime_overrides(args):
     if getattr(args, "profile_metrics", None):
         os.environ["PROFILE_METRICS"] = args.profile_metrics
-    if getattr(args, "autotune_use_profiler", False):
-        os.environ["TRITON_BENCH_METHOD"] = "npu"
-    if getattr(args, "print_autotuning", False):
-        os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
     if getattr(args, "persistent_programs", None) is not None:
         os.environ["PERSISTENT_PROGRAMS"] = str(args.persistent_programs)
 
@@ -1414,8 +1339,8 @@ def _run_bench(args):
         attention(q, k, v, args.causal, args.sm_scale)
     torch.npu.synchronize()
 
-    runtime = _describe_runtime(args.z, args.h, args.n_ctx, args.causal)
-    print(f"Selected autotune config: {runtime['best_config']}")
+    runtime = _describe_runtime(args.z, args.h, args.n_ctx, args.head_dim, args.causal)
+    print(f"Selected tiling config: {runtime['selected_config']} (source={runtime['tiling_source']})")
 
 
 def _run_torch_profile(args):
@@ -1426,7 +1351,7 @@ def _run_torch_profile(args):
 
 
 def _build_cli():
-    parser = argparse.ArgumentParser(description="Simple Flash Attention forward with autotune and profiling.")
+    parser = argparse.ArgumentParser(description="Simple Flash Attention forward with offline-tuned tiling and profiling.")
     subparsers = parser.add_subparsers(dest="command")
 
     def add_common_args(subparser):
@@ -1437,8 +1362,6 @@ def _build_cli():
         subparser.add_argument("--causal", action="store_true")
         subparser.add_argument("--dtype", default="float16", choices=["float16", "fp16", "bfloat16", "bf16"])
         subparser.add_argument("--sm-scale", type=float, default=0.5, dest="sm_scale")
-        subparser.add_argument("--autotune-use-profiler", action="store_true")
-        subparser.add_argument("--print-autotuning", action="store_true")
         subparser.add_argument("--persistent-programs", type=int)
 
     tune = subparsers.add_parser("tune")
@@ -1459,8 +1382,8 @@ def _build_cli():
 
 
 def _run_default_profile():
-    z, h, n_ctx, head_dim = 2, 8, 1024, 128
-    causal, dtype = False, torch.float16
+    z, h, n_ctx, head_dim = 128, 8, 1024, 128
+    causal, dtype = True, torch.float16
     q, k, v = _make_inputs(z, h, n_ctx, head_dim, dtype)
     profiling(z, h, n_ctx, head_dim, causal, q, k, v, sm_scale=0.5)
 
@@ -1477,7 +1400,8 @@ def main():
 __all__ = [
     "DEVICE",
     "RESULT_DIR_NAME",
-    "AUTOTUNE_CONFIGS",
+    "PROFILE_OP_NAME",
+    "get_tiling",
     "attention",
     "profile_once",
     "profiling",
