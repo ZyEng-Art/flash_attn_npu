@@ -14,14 +14,8 @@ DEFAULT_OUTPUT_JSON = "flash_attention_forward_tuned.json"
 DEFAULT_CANDIDATE_MODULE = "flash_attention_forward.py"
 DEFAULT_EVALUATE_MODULE = "evaluate_attention.py"
 
-TILING_CANDIDATES = [
-    (32, 32),
-    (64, 32),
-    (64, 64),
-    (128, 32),
-    (128, 64),
-    (128, 128),
-]
+BLOCK_M_CANDIDATES = (16, 32, 64, 128, 256)
+BLOCK_N_CANDIDATES = (16, 32, 64, 128, 256)
 
 PRESET_BEGIN = "# BEGIN AUTO-TUNED DEFAULT TILING PRESETS"
 PRESET_END = "# END AUTO-TUNED DEFAULT TILING PRESETS"
@@ -79,6 +73,48 @@ def _make_inputs(device: str, dtype, z: int, h: int, n_ctx: int, head_dim: int, 
     return q, k, v
 
 
+def _generate_tiling_candidates(shape):
+    _z, _h, n_ctx, head_dim, causal = shape
+    candidates = []
+    seen = set()
+
+    for bm in BLOCK_M_CANDIDATES:
+        if bm > max(256, n_ctx):
+            continue
+        if head_dim >= 256 and bm > 64:
+            continue
+        for bn in BLOCK_N_CANDIDATES:
+            if bn > max(256, n_ctx):
+                continue
+            if bm < bn:
+                continue
+            if head_dim >= 256 and bn > 64:
+                continue
+            if causal and bn > bm:
+                continue
+
+            candidate = (bm, bn)
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            candidates.append(candidate)
+
+    fallback_priority = [
+        (32, 32),
+        (64, 32),
+        (64, 64),
+        (128, 32),
+        (128, 64),
+        (128, 128),
+    ]
+    for candidate in fallback_priority:
+        if candidate not in seen:
+            seen.add(candidate)
+            candidates.append(candidate)
+
+    return candidates
+
+
 def _resolve_programs(module, z: int, h: int, n_ctx: int, block_m: int):
     total_tiles = ((n_ctx + block_m - 1) // block_m) * z * h
     persistent = module._get_persistent_programs()
@@ -86,52 +122,14 @@ def _resolve_programs(module, z: int, h: int, n_ctx: int, block_m: int):
 
 
 def _launch_fixed(module, q, k, v, causal: bool, sm_scale: float, bm: int, bn: int):
-    module._validate_inputs(q, k, v)
-    z, h, n_ctx, head_dim = q.shape
-    out = torch.empty_like(q)
-    lse = torch.empty((z, h, n_ctx), device=q.device, dtype=torch.float32)
-    acc = (
-        torch.empty((1,), dtype=torch.float32, device=q.device)
-        if head_dim < 256
-        else torch.zeros((z, h, n_ctx, head_dim), dtype=torch.float32, device=q.device)
-    )
-    stage = 3 if causal else 1
-    grid = _resolve_programs(module, z, h, n_ctx, bm)
+    if hasattr(module, "_launch_kernel"):
+        out, _lse = module._launch_kernel(q, k, v, causal, sm_scale, bm=bm, bn=bn)
+        return out
 
-    module._attn_fwd_fixed[grid](
-        q,
-        k,
-        v,
-        lse,
-        out,
-        acc,
-        sm_scale,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        out.stride(3),
-        z,
-        h,
-        N_CTX=n_ctx,
-        HEAD_DIM=head_dim,
-        BLOCK_M=bm,
-        BLOCK_N=bn,
-        STAGE=stage,
-        debug=False,
-    )
-    return out
+    if hasattr(module, "attention"):
+        return module.attention(q, k, v, causal, sm_scale, BM=bm, BN=bn)
+
+    raise AttributeError("candidate module does not expose `_launch_kernel` or `attention`")
 
 
 def _measure_candidate(module, q, k, v, causal: bool, sm_scale: float, bm: int, bn: int, iters: int):
@@ -174,6 +172,13 @@ def _measure_baseline(eval_module, q, k, v, h: int, causal: bool, sm_scale: floa
     }
 
 
+def _error_summary(exc: Exception):
+    message = str(exc).strip()
+    if not message:
+        return exc.__class__.__name__
+    return message.splitlines()[0][:240]
+
+
 def _merge_with_existing_output(output_path: Path, payload: dict):
     if not output_path.exists():
         return payload
@@ -213,8 +218,9 @@ def tune_case(module, eval_module, shape, dtype, sm_scale: float, seed: int, tun
     z, h, n_ctx, head_dim, causal = shape
     q, k, v = _make_inputs(module.DEVICE, dtype, z, h, n_ctx, head_dim, seed)
 
+    tiling_candidates = _generate_tiling_candidates(shape)
     candidate_rows = []
-    for bm, bn in TILING_CANDIDATES:
+    for bm, bn in tiling_candidates:
         try:
             _, stats = _measure_candidate(module, q, k, v, causal, sm_scale, bm, bn, tune_iters)
             candidate_rows.append({
@@ -227,7 +233,7 @@ def tune_case(module, eval_module, shape, dtype, sm_scale: float, seed: int, tun
             candidate_rows.append({
                 "config": {"BLOCK_M": bm, "BLOCK_N": bn},
                 "avg_us": None,
-                "error": str(exc).splitlines()[0][:240],
+                "error": _error_summary(exc),
             })
 
     viable = [row for row in candidate_rows if row.get("avg_us") is not None]
