@@ -610,8 +610,6 @@ def _attn_fwd_inner_loop(
     BLOCK_N: tl.constexpr,
     offs_m: tl.constexpr,
     offs_n: tl.constexpr,
-    row_mask,
-    FULL_ROWS: tl.constexpr,
     NEED_COL_MASK: tl.constexpr,
     NEED_CAUSAL_MASK: tl.constexpr,
     N_CTX: tl.constexpr,
@@ -647,8 +645,6 @@ def _attn_fwd_inner_loop(
         qk = qk * qk_scale
         if NEED_COL_MASK:
             qk = tl.where(curr_n_for_cmp[None, :] < N_CTX, qk, -1.0e6)
-        if not FULL_ROWS:
-            qk = tl.where(row_mask[:, None], qk, -1.0e6)
 
         if NEED_CAUSAL_MASK:
             causal_mask = offs_m_for_cmp[:, None] >= curr_n_for_cmp[None, :]
@@ -701,8 +697,6 @@ def _attn_fwd_inner(
     STAGE: tl.constexpr,
     offs_m: tl.constexpr,
     offs_n: tl.constexpr,
-    row_mask,
-    FULL_ROWS: tl.constexpr,
     N_CTX: tl.constexpr,
     fp8_v: tl.constexpr,
 ):
@@ -726,31 +720,7 @@ def _attn_fwd_inner(
             BLOCK_N,
             offs_m,
             offs_n,
-            row_mask,
-            FULL_ROWS,
             False,
-            False,
-            N_CTX,
-            fp8_v,
-        )
-        acc_ptr, l_i, m_i = _attn_fwd_inner_loop(
-            acc_ptr,
-            l_i,
-            m_i,
-            q,
-            k_block_ptr,
-            v_block_ptr,
-            full_hi,
-            stage_hi,
-            qk_scale,
-            BLOCK_M,
-            HEAD_DIM,
-            BLOCK_N,
-            offs_m,
-            offs_n,
-            row_mask,
-            FULL_ROWS,
-            True,
             False,
             N_CTX,
             fp8_v,
@@ -777,31 +747,7 @@ def _attn_fwd_inner(
             BLOCK_N,
             offs_m,
             offs_n,
-            row_mask,
-            FULL_ROWS,
             False,
-            True,
-            N_CTX,
-            fp8_v,
-        )
-        acc_ptr, l_i, m_i = _attn_fwd_inner_loop(
-            acc_ptr,
-            l_i,
-            m_i,
-            q,
-            k_block_ptr,
-            v_block_ptr,
-            full_hi,
-            stage_hi,
-            qk_scale,
-            BLOCK_M,
-            HEAD_DIM,
-            BLOCK_N,
-            offs_m,
-            offs_n,
-            row_mask,
-            FULL_ROWS,
-            True,
             True,
             N_CTX,
             fp8_v,
@@ -825,31 +771,7 @@ def _attn_fwd_inner(
         BLOCK_N,
         offs_m,
         offs_n,
-        row_mask,
-        FULL_ROWS,
         False,
-        False,
-        N_CTX,
-        fp8_v,
-    )
-    acc_ptr, l_i, m_i = _attn_fwd_inner_loop(
-        acc_ptr,
-        l_i,
-        m_i,
-        q,
-        k_block_ptr,
-        v_block_ptr,
-        full_hi,
-        N_CTX,
-        qk_scale,
-        BLOCK_M,
-        HEAD_DIM,
-        BLOCK_N,
-        offs_m,
-        offs_n,
-        row_mask,
-        FULL_ROWS,
-        True,
         False,
         N_CTX,
         fp8_v,
@@ -933,8 +855,6 @@ def _attn_fwd_tile(
 
     offs_m = task_m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
-    full_row_mask = tl.full((BLOCK_M,), 1, tl.int1)
-    tail_row_mask = offs_m < N_CTX
 
     m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     l_i = tl.zeros((BLOCK_M,), tl.float32) + 1.0
@@ -944,96 +864,47 @@ def _attn_fwd_tile(
         acc_offset = (((off_z.to(tl.int64) * H + off_h.to(tl.int64)) * N_CTX + task_m_idx * BLOCK_M) * HEAD_DIM)
         acc_ptr = acc + acc_offset
 
-    if N_CTX % BLOCK_M == 0:
-        q = tl.load(q_block_ptr)
+    tl.static_assert(N_CTX % BLOCK_M == 0)
+    q = tl.load(q_block_ptr)
 
-        if STAGE & 1:
-            acc_ptr, l_i, m_i = _attn_fwd_inner(
-                acc_ptr,
-                l_i,
-                m_i,
-                q,
-                k_block_ptr,
-                v_block_ptr,
-                task_m_idx,
-                sm_scale,
-                BLOCK_M,
-                HEAD_DIM,
-                BLOCK_N,
-                4 - STAGE,
-                offs_m,
-                offs_n,
-                full_row_mask,
-                True,
-                N_CTX,
-                V.dtype.element_ty == tl.float8e5,
-            )
-        if STAGE & 2:
-            acc_ptr, l_i, m_i = _attn_fwd_inner(
-                acc_ptr,
-                l_i,
-                m_i,
-                q,
-                k_block_ptr,
-                v_block_ptr,
-                task_m_idx,
-                sm_scale,
-                BLOCK_M,
-                HEAD_DIM,
-                BLOCK_N,
-                2,
-                offs_m,
-                offs_n,
-                full_row_mask,
-                True,
-                N_CTX,
-                V.dtype.element_ty == tl.float8e5,
-            )
-    else:
-        q = tl.load(q_block_ptr, boundary_check=(0, 1), padding_option="zero")
-
-        if STAGE & 1:
-            acc_ptr, l_i, m_i = _attn_fwd_inner(
-                acc_ptr,
-                l_i,
-                m_i,
-                q,
-                k_block_ptr,
-                v_block_ptr,
-                task_m_idx,
-                sm_scale,
-                BLOCK_M,
-                HEAD_DIM,
-                BLOCK_N,
-                4 - STAGE,
-                offs_m,
-                offs_n,
-                tail_row_mask,
-                False,
-                N_CTX,
-                V.dtype.element_ty == tl.float8e5,
-            )
-        if STAGE & 2:
-            acc_ptr, l_i, m_i = _attn_fwd_inner(
-                acc_ptr,
-                l_i,
-                m_i,
-                q,
-                k_block_ptr,
-                v_block_ptr,
-                task_m_idx,
-                sm_scale,
-                BLOCK_M,
-                HEAD_DIM,
-                BLOCK_N,
-                2,
-                offs_m,
-                offs_n,
-                tail_row_mask,
-                False,
-                N_CTX,
-                V.dtype.element_ty == tl.float8e5,
-            )
+    if STAGE & 1:
+        acc_ptr, l_i, m_i = _attn_fwd_inner(
+            acc_ptr,
+            l_i,
+            m_i,
+            q,
+            k_block_ptr,
+            v_block_ptr,
+            task_m_idx,
+            sm_scale,
+            BLOCK_M,
+            HEAD_DIM,
+            BLOCK_N,
+            4 - STAGE,
+            offs_m,
+            offs_n,
+            N_CTX,
+            V.dtype.element_ty == tl.float8e5,
+        )
+    if STAGE & 2:
+        acc_ptr, l_i, m_i = _attn_fwd_inner(
+            acc_ptr,
+            l_i,
+            m_i,
+            q,
+            k_block_ptr,
+            v_block_ptr,
+            task_m_idx,
+            sm_scale,
+            BLOCK_M,
+            HEAD_DIM,
+            BLOCK_N,
+            2,
+            offs_m,
+            offs_n,
+            N_CTX,
+            V.dtype.element_ty == tl.float8e5,
+        )
 
     m_i += tl.math.log(l_i)
     if HEAD_DIM < 256:
@@ -1045,12 +916,8 @@ def _attn_fwd_tile(
         accumulator = accumulator / l_i[:, None]
 
     m_ptrs = M + task_hz_idx * N_CTX + offs_m
-    if N_CTX % BLOCK_M == 0:
-        tl.store(m_ptrs, m_i.to(tl.float32))
-        tl.store(o_block_ptr, accumulator.to(Out.type.element_ty))
-    else:
-        tl.store(m_ptrs, m_i.to(tl.float32), mask=tail_row_mask)
-        tl.store(o_block_ptr, accumulator.to(Out.type.element_ty), boundary_check=(0, 1))
+    tl.store(m_ptrs, m_i.to(tl.float32))
+    tl.store(o_block_ptr, accumulator.to(Out.type.element_ty))
 
 
 @triton.jit
