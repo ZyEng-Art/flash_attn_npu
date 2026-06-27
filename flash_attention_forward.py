@@ -610,7 +610,6 @@ def _attn_fwd_inner_loop(
     BLOCK_N: tl.constexpr,
     offs_m: tl.constexpr,
     offs_n: tl.constexpr,
-    NEED_COL_MASK: tl.constexpr,
     NEED_CAUSAL_MASK: tl.constexpr,
     N_CTX: tl.constexpr,
     fp8_v: tl.constexpr,
@@ -631,20 +630,13 @@ def _attn_fwd_inner_loop(
         start_n = tl.multiple_of(start_n, BLOCK_N)
         curr_n = start_n + offs_n
 
-        if NEED_COL_MASK:
-            k = tl.load(k_block_ptr, boundary_check=(0, 1), padding_option="zero")
-            v = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        k = tl.load(k_block_ptr)
+        v = tl.load(v_block_ptr)
+        if NEED_CAUSAL_MASK:
             curr_n_for_cmp = curr_n.to(tl.float32)
-        else:
-            k = tl.load(k_block_ptr)
-            v = tl.load(v_block_ptr)
-            if NEED_CAUSAL_MASK:
-                curr_n_for_cmp = curr_n.to(tl.float32)
 
         qk = tl.dot(q, tl.trans(k))
         qk = qk * qk_scale
-        if NEED_COL_MASK:
-            qk = tl.where(curr_n_for_cmp[None, :] < N_CTX, qk, -1.0e6)
 
         if NEED_CAUSAL_MASK:
             causal_mask = offs_m_for_cmp[:, None] >= curr_n_for_cmp[None, :]
@@ -721,7 +713,6 @@ def _attn_fwd_inner(
             offs_m,
             offs_n,
             False,
-            False,
             N_CTX,
             fp8_v,
         )
@@ -747,7 +738,6 @@ def _attn_fwd_inner(
             BLOCK_N,
             offs_m,
             offs_n,
-            False,
             True,
             N_CTX,
             fp8_v,
@@ -771,7 +761,6 @@ def _attn_fwd_inner(
         BLOCK_N,
         offs_m,
         offs_n,
-        False,
         False,
         N_CTX,
         fp8_v,
