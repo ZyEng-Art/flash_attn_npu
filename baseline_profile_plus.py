@@ -605,7 +605,7 @@ def profile_baseline(Z, H, N_CTX, HEAD_DIM, causal, dtype, sm_scale=0.5, result_
 
 
 if __name__ == "__main__":
-    Z, H, N_CTX, HEAD_DIM = 128, 8, 8192, 64
+    Z, H, N_CTX, HEAD_DIM = 128, 8, 2048, 256
     causal = False
     dtype = torch.float16
     profile_baseline(Z, H, N_CTX, HEAD_DIM, causal, dtype, sm_scale=0.5)
