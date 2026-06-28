@@ -179,17 +179,14 @@ def _default_tiling(z, h, n_ctx, head_dim, causal):
             return 128, 32
         return 64, 32
 
+    # Non-causal is Vector/softmax-bound on Ascend; a large BLOCK_N consistently
+    # wins (measured 5-16x vs the old small-block heuristic). Size BN against UB:
+    # head_dim<=128 -> BN=256, head_dim>=256 -> BN=128 (qk fp32 + acc must fit 192KB).
     if head_dim >= 256:
-        return 32, 32
-    if head_dim >= 128:
-        return (64, 32) if n_ctx >= 2048 else (32, 32)
-    if n_ctx >= 8192:
-        return 128, 32
-    if n_ctx >= 2048:
-        return 64, 64
-    if n_ctx >= 1024:
-        return (64, 64) if head_dim <= 64 else (64, 32)
-    return (64, 32) if head_dim <= 64 else (32, 32)
+        block_m, block_n = 64, 128
+    else:
+        block_m, block_n = 128, 256
+    return min(block_m, n_ctx), min(block_n, n_ctx)
 
 
 def get_tiling(z, h, n_ctx, head_dim, causal):
@@ -803,9 +800,21 @@ def _attn_fwd_tile(
     STAGE: tl.constexpr,
     linear_tile,
 ):
+    # Tile-to-core decomposition depends on STAGE (compile-time constant), trading off
+    # load balance vs K/V cache reuse on the persistent (stride-P) grid:
+    #   causal (STAGE==3): work grows with m_idx, so hz-major mapping leaves each core
+    #     seeing only m_idx == pid (mod gcd(P, num_tiles_m)) -> stragglers. m-major
+    #     (num_hz >> P) makes every core sample all m_idx evenly -> balanced.
+    #   non-causal (STAGE==1): all tiles cost the same, so keep hz-major to hold
+    #     consecutive same-(z,h) tiles -> K/V stay hot in L2 (m-major loses ~6%).
     num_tiles_m = tl.cdiv(N_CTX, BLOCK_M)
-    task_hz_idx = linear_tile // num_tiles_m
-    task_m_idx = linear_tile - task_hz_idx * num_tiles_m
+    if STAGE == 3:
+        num_hz = Z * H
+        task_m_idx = linear_tile // num_hz
+        task_hz_idx = linear_tile - task_m_idx * num_hz
+    else:
+        task_hz_idx = linear_tile // num_tiles_m
+        task_m_idx = linear_tile - task_hz_idx * num_tiles_m
     off_z = task_hz_idx // H
     off_h = task_hz_idx % H
     qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
