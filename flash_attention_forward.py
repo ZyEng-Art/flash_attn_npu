@@ -593,6 +593,136 @@ def _describe_runtime(z, h, n_ctx, head_dim, causal, bm=None, bn=None):
         "stage": 3 if causal else 1,
     }
 
+@triton.jit
+def _attn_fwd_inner_loop_full_seq(
+    acc_ptr,
+    l_i,
+    m_i,
+    q,
+    k_block_ptr,
+    v_block_ptr,
+    qk_scale,
+    BLOCK_M: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    N_CTX: tl.constexpr,
+    fp8_v: tl.constexpr,
+):
+    if HEAD_DIM >= 256:
+        row = tl.arange(0, BLOCK_M)[:, None]
+        col_head_dim = tl.arange(0, HEAD_DIM)[None, :]
+        block2d_acc = row * HEAD_DIM + col_head_dim
+
+    tile_count = N_CTX // BLOCK_N
+    has_tail = (tile_count % 2) == 1
+    main_hi = N_CTX - (BLOCK_N if has_tail else 0)
+
+    for start_n in tl.range(0, main_hi, 2 * BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        k0 = tl.load(tl.advance(k_block_ptr, (start_n, 0)))
+        v0 = tl.load(tl.advance(v_block_ptr, (start_n, 0)))
+        extension.multibuffer(k0, 2)
+        extension.multibuffer(v0, 2)
+
+        tile1_start_n = start_n + BLOCK_N
+        k1 = tl.load(tl.advance(k_block_ptr, (tile1_start_n, 0)))
+        v1 = tl.load(tl.advance(v_block_ptr, (tile1_start_n, 0)))
+        extension.multibuffer(k1, 2)
+        extension.multibuffer(v1, 2)
+
+        qk = tl.dot(q, tl.trans(k0))
+        qk = qk * qk_scale
+        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+        qk -= m_ij[:, None]
+
+        p = tl.math.exp(qk)
+        p_cast = p.to(tl.float8e5) if fp8_v else p.to(k0.dtype)
+        l_ij = tl.sum(p, axis=1)
+        alpha = tl.math.exp(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+
+        if HEAD_DIM < 256:
+            acc_ptr = acc_ptr * alpha[:, None]
+            acc_ptr = tl.dot(p_cast, v0, acc_ptr)
+        else:
+            pv = tl.dot(p_cast, v0)
+            acc = tl.load(acc_ptr + block2d_acc)
+            for slice_idx in range(4):
+                offset = slice_idx * (BLOCK_M // 4)
+                acc_i = extension.extract_slice(acc, (offset, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+                alpha_i = extension.extract_slice(alpha, [offset], [BLOCK_M // 4], [1])
+                pv_i = extension.extract_slice(pv, (offset, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+                acc_i = acc_i * alpha_i[:, None] + pv_i
+                acc = extension.insert_slice(acc, acc_i, (offset, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+            tl.store(acc_ptr + block2d_acc, acc)
+
+        m_i = m_ij
+
+        qk = tl.dot(q, tl.trans(k1))
+        qk = qk * qk_scale
+        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+        qk -= m_ij[:, None]
+
+        p = tl.math.exp(qk)
+        p_cast = p.to(tl.float8e5) if fp8_v else p.to(k1.dtype)
+        l_ij = tl.sum(p, axis=1)
+        alpha = tl.math.exp(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+
+        if HEAD_DIM < 256:
+            acc_ptr = acc_ptr * alpha[:, None]
+            acc_ptr = tl.dot(p_cast, v1, acc_ptr)
+        else:
+            pv = tl.dot(p_cast, v1)
+            acc = tl.load(acc_ptr + block2d_acc)
+            for slice_idx in range(4):
+                offset = slice_idx * (BLOCK_M // 4)
+                acc_i = extension.extract_slice(acc, (offset, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+                alpha_i = extension.extract_slice(alpha, [offset], [BLOCK_M // 4], [1])
+                pv_i = extension.extract_slice(pv, (offset, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+                acc_i = acc_i * alpha_i[:, None] + pv_i
+                acc = extension.insert_slice(acc, acc_i, (offset, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+            tl.store(acc_ptr + block2d_acc, acc)
+
+        m_i = m_ij
+
+    if has_tail:
+        tail_start_n = N_CTX - BLOCK_N
+        k_tail = tl.load(tl.advance(k_block_ptr, (tail_start_n, 0)))
+        v_tail = tl.load(tl.advance(v_block_ptr, (tail_start_n, 0)))
+        extension.multibuffer(k_tail, 2)
+        extension.multibuffer(v_tail, 2)
+
+        qk = tl.dot(q, tl.trans(k_tail))
+        qk = qk * qk_scale
+        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+        qk -= m_ij[:, None]
+
+        p = tl.math.exp(qk)
+        p_cast = p.to(tl.float8e5) if fp8_v else p.to(k_tail.dtype)
+        l_ij = tl.sum(p, axis=1)
+        alpha = tl.math.exp(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+
+        if HEAD_DIM < 256:
+            acc_ptr = acc_ptr * alpha[:, None]
+            acc_ptr = tl.dot(p_cast, v_tail, acc_ptr)
+        else:
+            pv = tl.dot(p_cast, v_tail)
+            acc = tl.load(acc_ptr + block2d_acc)
+            for slice_idx in range(4):
+                offset = slice_idx * (BLOCK_M // 4)
+                acc_i = extension.extract_slice(acc, (offset, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+                alpha_i = extension.extract_slice(alpha, [offset], [BLOCK_M // 4], [1])
+                pv_i = extension.extract_slice(pv, (offset, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+                acc_i = acc_i * alpha_i[:, None] + pv_i
+                acc = extension.insert_slice(acc, acc_i, (offset, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+            tl.store(acc_ptr + block2d_acc, acc)
+
+        m_i = m_ij
+
+    return acc_ptr, l_i, m_i
+
 
 @triton.jit
 def _attn_fwd_inner_loop(
@@ -626,13 +756,12 @@ def _attn_fwd_inner_loop(
         # Ascend compare paths are much more likely to stay vectorized with fp32 than int64/int32.
         offs_m_for_cmp = offs_m.to(tl.float32)
 
-    
-    for start_n in tl.range(lo, hi, BLOCK_N):
+    for start_n in tl.range(lo, hi, BLOCK_N, num_stages=2):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         curr_n = start_n + offs_n
 
         k = tl.load(k_block_ptr)
-        v = tl.load(v_block_ptr)
+        extension.multibuffer(k, 2)
         if NEED_CAUSAL_MASK:
             curr_n_for_cmp = curr_n.to(tl.float32)
 
@@ -651,6 +780,9 @@ def _attn_fwd_inner_loop(
         l_ij = tl.sum(p, axis=1)
         alpha = tl.math.exp(m_i - m_ij)
         l_i = l_i * alpha + l_ij
+
+        v = tl.load(v_block_ptr)
+        extension.multibuffer(v, 2)
 
         if HEAD_DIM < 256:
             acc_ptr = acc_ptr * alpha[:, None]
@@ -857,44 +989,60 @@ def _attn_fwd_tile(
     tl.static_assert(N_CTX % BLOCK_M == 0)
     q = tl.load(q_block_ptr)
 
-    if STAGE & 1:
-        acc_ptr, l_i, m_i = _attn_fwd_inner(
+    if STAGE == 1:
+        acc_ptr, l_i, m_i = _attn_fwd_inner_loop_full_seq(
             acc_ptr,
             l_i,
             m_i,
             q,
             k_block_ptr,
             v_block_ptr,
-            task_m_idx,
             sm_scale,
             BLOCK_M,
             HEAD_DIM,
             BLOCK_N,
-            4 - STAGE,
-            offs_m,
-            offs_n,
             N_CTX,
             V.dtype.element_ty == tl.float8e5,
         )
-    if STAGE & 2:
-        acc_ptr, l_i, m_i = _attn_fwd_inner(
-            acc_ptr,
-            l_i,
-            m_i,
-            q,
-            k_block_ptr,
-            v_block_ptr,
-            task_m_idx,
-            sm_scale,
-            BLOCK_M,
-            HEAD_DIM,
-            BLOCK_N,
-            2,
-            offs_m,
-            offs_n,
-            N_CTX,
-            V.dtype.element_ty == tl.float8e5,
-        )
+    else:
+        if STAGE & 1:
+            acc_ptr, l_i, m_i = _attn_fwd_inner(
+                acc_ptr,
+                l_i,
+                m_i,
+                q,
+                k_block_ptr,
+                v_block_ptr,
+                task_m_idx,
+                sm_scale,
+                BLOCK_M,
+                HEAD_DIM,
+                BLOCK_N,
+                4 - STAGE,
+                offs_m,
+                offs_n,
+                N_CTX,
+                V.dtype.element_ty == tl.float8e5,
+            )
+        if STAGE & 2:
+            acc_ptr, l_i, m_i = _attn_fwd_inner(
+                acc_ptr,
+                l_i,
+                m_i,
+                q,
+                k_block_ptr,
+                v_block_ptr,
+                task_m_idx,
+                sm_scale,
+                BLOCK_M,
+                HEAD_DIM,
+                BLOCK_N,
+                2,
+                offs_m,
+                offs_n,
+                N_CTX,
+                V.dtype.element_ty == tl.float8e5,
+            )
 
     m_i += tl.math.log(l_i)
     if HEAD_DIM < 256:
