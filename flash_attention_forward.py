@@ -160,9 +160,9 @@ DEFAULT_TILING_PRESETS = {
     (128, 8, 1024, 128, True): (128, 64),
     (128, 8, 1024, 256, True): (64, 64),
     (128, 8, 2048, 128, True): (128, 64),
-    (128, 8, 2048, 256, False): (64, 64),
-    (128, 8, 4096, 128, False): (128, 128),
-    (128, 8, 8192, 64, False): (128, 128),
+    (128, 8, 2048, 256, False): (64, 128),
+    (128, 8, 4096, 128, False): (128, 256),
+    (128, 8, 8192, 64, False): (128, 256),
 }
 # END AUTO-TUNED DEFAULT TILING PRESETS
 
@@ -637,7 +637,7 @@ def _attn_fwd_inner_loop(
             curr_n_for_cmp = curr_n.to(tl.float32)
 
         qk = tl.dot(q, tl.trans(k))
-        qk = qk * qk_scale
+        # qk = qk * qk_scale
 
         if NEED_CAUSAL_MASK:
             causal_mask = offs_m_for_cmp[:, None] >= curr_n_for_cmp[None, :]
@@ -856,7 +856,7 @@ def _attn_fwd_tile(
 
     tl.static_assert(N_CTX % BLOCK_M == 0)
     q = tl.load(q_block_ptr)
-
+    q = (q * sm_scale).to(q.dtype)
     if STAGE & 1:
         acc_ptr, l_i, m_i = _attn_fwd_inner(
             acc_ptr,
@@ -1239,7 +1239,7 @@ def _build_cli():
 
 
 def _run_default_profile():
-    z, h, n_ctx, head_dim = 128, 8, 2048, 256
+    z, h, n_ctx, head_dim = 128, 8, 8192, 64
     causal, dtype = False, torch.float16
     q, k, v = _make_inputs(z, h, n_ctx, head_dim, dtype)
     profiling(z, h, n_ctx, head_dim, causal, q, k, v, sm_scale=0.5)

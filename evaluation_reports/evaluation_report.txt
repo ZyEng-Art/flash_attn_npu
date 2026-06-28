@@ -3,7 +3,7 @@ Evaluation Summary
 candidate_module=/workspace/new_attn/flash_attention_forward.py
 dtype=float16, sm_scale=0.5
 performance_metric=median_us, trim_ratio=0.1, warmup=5, iters=30
-correctness_score=40.000 / 40.000, performance_score=12.337 / 60.000, total_score=52.337 / 100
+correctness_score=40.000 / 40.000, performance_score=19.716 / 60.000, total_score=59.716 / 100
 
 Correctness Cases
 -----------------
@@ -28,9 +28,9 @@ Correctness Cases
 
 Performance Cases
 -----------------
-[1] shape=(128,8,1024,128, causal=True) match=True score=1.705 baseline_median_us=2989.800 candidate_median_us=17537.370 speedup=0.1705 baseline_cv=0.0389 candidate_cv=0.0034 max_abs_diff=0.000977 error=
-[2] shape=(128,8,1024,256, causal=True) match=True score=1.454 baseline_median_us=4932.585 candidate_median_us=33933.030 speedup=0.1454 baseline_cv=0.0289 candidate_cv=0.0068 max_abs_diff=0.000977 error=
-[3] shape=(128,8,2048,128, causal=True) match=True score=1.813 baseline_median_us=10476.620 candidate_median_us=57776.545 speedup=0.1813 baseline_cv=0.0064 candidate_cv=0.0025 max_abs_diff=0.000977 error=
-[4] shape=(128,8,2048,256, causal=False) match=True score=1.675 baseline_median_us=35088.185 candidate_median_us=209496.630 speedup=0.1675 baseline_cv=0.0025 candidate_cv=0.0027 max_abs_diff=0.000977 error=
-[5] shape=(128,8,4096,128, causal=False) match=True score=2.737 baseline_median_us=62252.501 candidate_median_us=227474.060 speedup=0.2737 baseline_cv=0.0609 candidate_cv=0.0019 max_abs_diff=0.000244 error=
-[6] shape=(128,8,8192,64, causal=False) match=True score=2.954 baseline_median_us=232255.275 candidate_median_us=786355.350 speedup=0.2954 baseline_cv=0.0404 candidate_cv=0.0004 max_abs_diff=0.000061 error=
+[1] shape=(128,8,1024,128, causal=True) match=True score=1.920 baseline_median_us=5688.230 candidate_median_us=29623.415 speedup=0.1920 baseline_cv=1.6228 candidate_cv=1.2908 max_abs_diff=0.000977 error=
+[2] shape=(128,8,1024,256, causal=True) match=True score=1.378 baseline_median_us=4934.689 candidate_median_us=35802.460 speedup=0.1378 baseline_cv=0.0062 candidate_cv=0.0055 max_abs_diff=0.000977 error=
+[3] shape=(128,8,2048,128, causal=True) match=True score=1.771 baseline_median_us=10447.525 candidate_median_us=59006.400 speedup=0.1771 baseline_cv=0.0055 candidate_cv=0.0016 max_abs_diff=0.000977 error=
+[4] shape=(128,8,2048,256, causal=False) match=True score=5.335 baseline_median_us=112022.460 candidate_median_us=209987.360 speedup=0.5335 baseline_cv=0.7054 candidate_cv=0.4289 max_abs_diff=0.000977 error=
+[5] shape=(128,8,4096,128, causal=False) match=True score=4.955 baseline_median_us=128244.905 candidate_median_us=258821.575 speedup=0.4955 baseline_cv=0.3360 candidate_cv=0.1776 max_abs_diff=0.000244 error=
+[6] shape=(128,8,8192,64, causal=False) match=True score=4.357 baseline_median_us=289849.255 candidate_median_us=665254.695 speedup=0.4357 baseline_cv=0.0863 candidate_cv=0.0401 max_abs_diff=0.000061 error=
