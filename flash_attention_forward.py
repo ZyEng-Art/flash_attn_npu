@@ -167,12 +167,45 @@ DEFAULT_TILING_PRESETS = {
 # END AUTO-TUNED DEFAULT TILING PRESETS
 
 
+# Decide whether the fp32 accumulator stays resident in UB (fast: fused alpha-rescale
+# in tl.dot) vs. spills to a GM workspace with per-iteration load/store + extract_slice
+# (slow: pure Vector/MTE overhead). For head_dim<256 it always fits. For head_dim==256
+# we estimate the live UB footprint (acc + qk + q + k + v) and keep it in UB only when
+# it clears the budget with margin -- measured: (BM=64,BN=64,d256)=176KB wins in UB,
+# (BM=64,BN=128,d256)=256KB must use GM. Override the budget via env to sweep.
+_UB_BYTES = 192 * 1024
+
+
+def _ub_budget():
+    raw = os.environ.get("ACC_UB_BUDGET")
+    return int(raw) if raw else 190 * 1024
+
+
+def _ub_footprint_bytes(block_m, block_n, head_dim):
+    acc = block_m * head_dim * 4          # fp32 accumulator
+    qk = block_m * block_n * 4            # fp32 scores
+    q = block_m * head_dim * 2            # fp16 query tile
+    kv = 2 * block_n * head_dim * 2       # fp16 key + value tiles
+    return acc + qk + q + kv
+
+
+def _acc_in_ub(block_m, head_dim, block_n=None):
+    if head_dim < 256:
+        return True
+    if block_n is None:
+        return False
+    return _ub_footprint_bytes(block_m, block_n, head_dim) <= _ub_budget()
+
+
 def _default_tiling(z, h, n_ctx, head_dim, causal):
     preset = DEFAULT_TILING_PRESETS.get((z, h, n_ctx, head_dim, causal))
     if preset is not None:
         return preset
 
     if causal:
+        if head_dim >= 256:
+            # (64,64) keeps the fp32 acc in UB (176KB) -> +16% vs the GM-workspace path.
+            return min(64, n_ctx), min(64, n_ctx)
         if head_dim >= 128:
             return (64, 32) if n_ctx >= 2048 else (32, 32)
         if n_ctx >= 8192:
@@ -610,11 +643,12 @@ def _attn_fwd_inner_loop(
     NEED_CAUSAL_MASK: tl.constexpr,
     N_CTX: tl.constexpr,
     fp8_v: tl.constexpr,
+    ACC_IN_UB: tl.constexpr,
 ):
     k_block_ptr = tl.advance(k_block_ptr, (lo, 0))
     v_block_ptr = tl.advance(v_block_ptr, (lo, 0))
 
-    if HEAD_DIM >= 256:
+    if not ACC_IN_UB:
         row = tl.arange(0, BLOCK_M)[:, None]
         col_head_dim = tl.arange(0, HEAD_DIM)[None, :]
         block2d_acc = row * HEAD_DIM + col_head_dim
@@ -649,7 +683,7 @@ def _attn_fwd_inner_loop(
         alpha = tl.math.exp(m_i - m_ij)
         l_i = l_i * alpha + l_ij
 
-        if HEAD_DIM < 256:
+        if ACC_IN_UB:
             acc_ptr = acc_ptr * alpha[:, None]
             acc_ptr = tl.dot(p_cast, v, acc_ptr)
         else:
@@ -689,6 +723,7 @@ def _attn_fwd_inner(
     offs_n: tl.constexpr,
     N_CTX: tl.constexpr,
     fp8_v: tl.constexpr,
+    ACC_IN_UB: tl.constexpr,
 ):
     if STAGE == 1:
         tl.static_assert(BLOCK_M >= BLOCK_N)
@@ -713,6 +748,7 @@ def _attn_fwd_inner(
             False,
             N_CTX,
             fp8_v,
+            ACC_IN_UB,
         )
         return acc_ptr, l_i, m_i
 
@@ -739,6 +775,7 @@ def _attn_fwd_inner(
             True,
             N_CTX,
             fp8_v,
+            ACC_IN_UB,
         )
         return acc_ptr, l_i, m_i
 
@@ -762,6 +799,7 @@ def _attn_fwd_inner(
         False,
         N_CTX,
         fp8_v,
+        ACC_IN_UB,
     )
     return acc_ptr, l_i, m_i
 
@@ -798,6 +836,7 @@ def _attn_fwd_tile(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     STAGE: tl.constexpr,
+    ACC_IN_UB: tl.constexpr,
     linear_tile,
 ):
     # Tile-to-core decomposition depends on STAGE (compile-time constant), trading off
@@ -857,7 +896,7 @@ def _attn_fwd_tile(
 
     m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     l_i = tl.zeros((BLOCK_M,), tl.float32) + 1.0
-    if HEAD_DIM < 256:
+    if ACC_IN_UB:
         acc_ptr = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
     else:
         acc_offset = (((off_z.to(tl.int64) * H + off_h.to(tl.int64)) * N_CTX + task_m_idx * BLOCK_M) * HEAD_DIM)
@@ -884,6 +923,7 @@ def _attn_fwd_tile(
             offs_n,
             N_CTX,
             V.dtype.element_ty == tl.float8e5,
+            ACC_IN_UB,
         )
     if STAGE & 2:
         acc_ptr, l_i, m_i = _attn_fwd_inner(
@@ -903,10 +943,11 @@ def _attn_fwd_tile(
             offs_n,
             N_CTX,
             V.dtype.element_ty == tl.float8e5,
+            ACC_IN_UB,
         )
 
     m_i += tl.math.log(l_i)
-    if HEAD_DIM < 256:
+    if ACC_IN_UB:
         accumulator = acc_ptr / l_i[:, None]
     else:
         row = tl.arange(0, BLOCK_M)[:, None]
@@ -951,6 +992,7 @@ def _attn_fwd(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     STAGE: tl.constexpr,
+    ACC_IN_UB: tl.constexpr,
 ):
     num_tiles_m = tl.cdiv(N_CTX, BLOCK_M)
     total_tiles = num_tiles_m * Z * H
@@ -989,6 +1031,7 @@ def _attn_fwd(
             BLOCK_M,
             BLOCK_N,
             STAGE,
+            ACC_IN_UB,
             linear_tile,
         )
 
@@ -1016,9 +1059,13 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None):
     bm, bn, _ = _resolve_tiling(z, h, n_ctx, head_dim, causal, bm, bn)
     out = torch.empty_like(q)
     lse = torch.empty((z, h, n_ctx), device=q.device, dtype=torch.float32)
+    # Keep the fp32 accumulator in UB whenever (BLOCK_M x HEAD_DIM) fits, even for
+    # HEAD_DIM==256. This avoids the per-KV-iteration GM round-trip + extract_slice
+    # path, which is pure Vector/MTE overhead on the critical path.
+    acc_in_ub = _acc_in_ub(bm, head_dim, bn)
     acc = (
         torch.empty((1,), dtype=torch.float32, device=q.device)
-        if head_dim < 256
+        if acc_in_ub
         else torch.zeros((z, h, n_ctx, head_dim), dtype=torch.float32, device=q.device)
     )
     stage = 3 if causal else 1
@@ -1055,6 +1102,7 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None):
         BLOCK_M=bm,
         BLOCK_N=bn,
         STAGE=stage,
+        ACC_IN_UB=acc_in_ub,
         debug=False,
     )
     return out, lse
