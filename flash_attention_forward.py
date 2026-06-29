@@ -157,9 +157,12 @@ DEFAULT_AIC_METRIC_CANDIDATES = [
 # Default tiling presets captured from offline tuning.
 # This block is rewritten by `tune_flash_attention_forward.py`.
 DEFAULT_TILING_PRESETS = {
-    (128, 8, 1024, 128, True): (128, 64),
-    (128, 8, 1024, 256, True): (64, 64),
-    (128, 8, 2048, 128, True): (128, 64),
+    # causal: BLOCK_M < BLOCK_N now allowed (see _attn_fwd_inner STAGE 2). A wide BLOCK_N
+    # cuts the iteration count / Vector-scalar overhead just like non-causal -- measured
+    # +18..24% vs the old BM>=BN presets on these (worst) causal cases.
+    (128, 8, 1024, 128, True): (64, 256),
+    (128, 8, 1024, 256, True): (64, 128),
+    (128, 8, 2048, 128, True): (64, 256),
     (128, 8, 2048, 256, False): (64, 128),
     (128, 8, 4096, 128, False): (128, 256),
     (128, 8, 8192, 64, False): (128, 256),
@@ -203,14 +206,13 @@ def _default_tiling(z, h, n_ctx, head_dim, causal):
         return preset
 
     if causal:
+        # BLOCK_M < BLOCK_N is allowed for causal (STAGE 2 generalized). A wide BLOCK_N
+        # cuts iteration count / Vector-scalar overhead -> measured +18..24% vs BM>=BN.
         if head_dim >= 256:
-            # (64,64) keeps the fp32 acc in UB (176KB) -> +16% vs the GM-workspace path.
-            return min(64, n_ctx), min(64, n_ctx)
-        if head_dim >= 128:
-            return (64, 32) if n_ctx >= 2048 else (32, 32)
-        if n_ctx >= 8192:
-            return 128, 32
-        return 64, 32
+            # head256 + BN=256 overflows UB; (64,128) (GM acc) still beats (64,64).
+            return min(64, n_ctx), min(128, n_ctx)
+        # head_dim <= 128: (64,256) fits and consistently wins.
+        return min(64, n_ctx), min(256, n_ctx)
 
     # Non-causal is Vector/softmax-bound on Ascend; a large BLOCK_N consistently
     # wins (measured 5-16x vs the old small-block heuristic). Size BN against UB:
@@ -726,7 +728,9 @@ def _attn_fwd_inner(
     ACC_IN_UB: tl.constexpr,
 ):
     if STAGE == 1:
-        tl.static_assert(BLOCK_M >= BLOCK_N)
+        # Off-band (strictly below the diagonal block): key columns [0, off_hi) where
+        # off_hi = floor(start_m*BLOCK_M / BLOCK_N)*BLOCK_N. These are fully valid (no
+        # mask). Works for any BLOCK_M/BLOCK_N (incl. BLOCK_M < BLOCK_N).
         stage_lo = 0
         stage_hi = start_m * BLOCK_M
         full_hi = stage_hi - (stage_hi % BLOCK_N)
@@ -753,10 +757,17 @@ def _attn_fwd_inner(
         return acc_ptr, l_i, m_i
 
     if STAGE == 2:
-        tl.static_assert(BLOCK_M >= BLOCK_N)
-        stage_lo = tl.multiple_of(start_m * BLOCK_M, BLOCK_M)
-        stage_hi = tl.minimum((start_m + 1) * BLOCK_M, N_CTX)
-        full_hi = stage_hi - ((stage_hi - stage_lo) % BLOCK_N)
+        # On-band (the diagonal): masked key blocks covering [off_hi, on_hi), where
+        #   off_hi = floor(start_m*BLOCK_M / BLOCK_N)*BLOCK_N        (continues off-band)
+        #   on_hi  = ceil((start_m+1)*BLOCK_M / BLOCK_N)*BLOCK_N     (last block w/ diagonal)
+        # This generalizes the diagonal handling to any BLOCK_M/BLOCK_N. When
+        # BLOCK_M >= BLOCK_N (a multiple) it reduces to [start_m*BM, (start_m+1)*BM).
+        # When BLOCK_M < BLOCK_N a single wide key block straddles the diagonal and is
+        # masked. Requires N_CTX % BLOCK_N == 0 so on_hi never exceeds N_CTX.
+        tl.static_assert(N_CTX % BLOCK_N == 0)
+        stage_lo = tl.multiple_of((start_m * BLOCK_M // BLOCK_N) * BLOCK_N, BLOCK_N)
+        stage_hi = (start_m + 1) * BLOCK_M
+        full_hi = ((stage_hi + BLOCK_N - 1) // BLOCK_N) * BLOCK_N
         acc_ptr, l_i, m_i = _attn_fwd_inner_loop(
             acc_ptr,
             l_i,
