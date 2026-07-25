@@ -782,3 +782,43 @@
   - `profiling_runs/sim_point6_baseline/OPPROF_20260725023458_FUPEWIPFAYQPOEYP/simulator/`
   - `evaluation_reports/codex_point7_wide_lazy_gm_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point7_wide_lazy_gm_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 2: causal D128 short-context wide-lazy-GM tiling
+
+- Commit: source + journal commit for this entry.
+- Optimization point: 2, tiling optimization.
+- Content:
+  - Revisited the first performance case `(128, 8, 1024, 128, causal=True)` after the positive wide-lazy-GM policy was
+    available.
+  - Changed only that preset from `(BLOCK_M=128, BLOCK_N=64)` to `(BLOCK_M=64, BLOCK_N=256)`.
+  - Under the previous implementation, `(64,256)` used the stable softmax path and was slightly slower; under the current
+    implementation it routes to lazy softmax with a GM accumulator, reducing the number of KV-loop iterations while
+    avoiding the lazy+resident-accumulator L0C overflow.
+  - Updated the preset comment to point at this journal rather than stale historical sweep wording.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point2_shape1_wide_lazy_gm_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point2_shape1_wide_lazy_gm_performance/evaluation_report.json`.
+  - Performance score improved marginally from the active wide-lazy-GM implementation `21.0465 / 60` to `21.0501 / 60`.
+  - Mean speedup improved from `0.3507746595843307` to `0.3508343006383436`.
+  - Median speedup changed from `0.3381159877112202` to `0.3378251885212862`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.249607 -> 0.255697`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.286369 -> 0.281544`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.286779 -> 0.287466`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.466992 -> 0.468715`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.389453 -> 0.388185`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.425448 -> 0.423399`.
+- Issues:
+  - The aggregate gain is very small (`+0.0036 / 60`), so this should be treated as a marginal positive rather than a
+    robust architectural win.
+  - Only the first performance case has a routed source-path change; the other per-shape differences are mostly
+    benchmark variance.
+  - If a later repeated run shows this preset consistently below `(128,64)`, this entry can be reverted independently
+    without affecting the wider point 7 lazy-GM policy.
+- Reports:
+  - `evaluation_reports/codex_point2_shape1_wide_lazy_gm_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point2_shape1_wide_lazy_gm_performance/evaluation_report.json`

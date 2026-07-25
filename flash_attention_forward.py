@@ -160,15 +160,15 @@ DEFAULT_TILING_PRESETS = {
     # Tuned per case over {(BM,BN)} x {lazy, stable}. Two independent levers:
     #   - lazy (non-stabilized) softmax for BLOCK_N<=128 (see _use_lazy): drops the
     #     per-iteration max/alpha/acc-rescale Vector overhead.
-    #   - wide BLOCK_N=256 (stable) for the cases where iteration-count reduction wins
-    #     more than lazy (and BLOCK_M<BLOCK_N is now allowed for causal, see STAGE 2).
-    # Measured vs the original stable BM>=BN baseline: +25/53/32/30% on the 4 tuned cases.
-    (128, 8, 1024, 128, True): (128, 64),    # lazy
+    #   - wide BLOCK_N=256 for the cases where iteration-count reduction wins; the
+    #     wide-lazy-GM family below keeps lazy viable by spilling the accumulator.
+    # See optimization_journal.md for the measured per-shape deltas behind each preset.
+    (128, 8, 1024, 128, True): (64, 256),    # wide lazy with GM accumulator
     (128, 8, 1024, 256, True): (64, 128),    # lazy (BM<BN)
-    (128, 8, 2048, 128, True): (64, 256),    # stable, wide BN (BM<BN)
+    (128, 8, 2048, 128, True): (64, 256),    # wide lazy with GM accumulator
     (128, 8, 2048, 256, False): (128, 128),  # lazy
-    (128, 8, 4096, 128, False): (128, 256),  # stable, wide BN
-    (128, 8, 8192, 64, False): (128, 256),   # stable, wide BN
+    (128, 8, 4096, 128, False): (128, 256),  # wide lazy with GM accumulator
+    (128, 8, 8192, 64, False): (128, 256),   # wide lazy with GM accumulator
 }
 # END AUTO-TUNED DEFAULT TILING PRESETS
 
