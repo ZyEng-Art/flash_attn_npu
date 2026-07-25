@@ -2154,3 +2154,39 @@
 - Reports:
   - `evaluation_reports/codex_point14_d128_compile_params_2048_only_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point14_d128_compile_params_2048_only_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 25: D128 2048 sync-only compile-param regression
+
+- Commit: journal-only commit for this entry; source was reverted after the regression.
+- Optimization point: 25, IR analysis optimization, evaluated as an ablation of the positive D128 causal 2048 compile
+  parameter bundle.
+- Motivation:
+  - The positive D128 strategy split keeps explicit CV parameters only for `(128, 8, 2048, 128, causal=True)`.
+  - The next question was whether the benefit comes from sync/mixed-CV scheduling alone or from the heavier
+    multi-buffer/workspace part of the bundle.
+  - Hypothesis: keeping only `enable_mixed_cv`, `enable_auto_bind_sub_block`, and `sync_solver` on the 2048 branch might
+    preserve the scheduling benefit while reducing local-buffer pressure.
+- Content:
+  - Temporarily removed `multibuffer=True`, `limit_auto_multi_buffer_of_local_buffer="no-limit"`, and
+    `set_workspace_multibuffer=2` from the D128 `N_CTX=2048` hz-major launch.
+  - Kept only `enable_mixed_cv=True`, `enable_auto_bind_sub_block=True`, and `sync_solver=True` on that branch.
+  - Left the D128 `N_CTX=1024` no-parameter branch and generic fallback paths unchanged.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point25_d128_2048_sync_params_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point25_d128_2048_sync_params_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.400443902045232 / 60` to
+    `21.288106951474145 / 60`.
+  - Mean speedup regressed from `0.3733407317007539` to `0.35480178252456906`.
+  - Median speedup regressed from `0.3668445691470613` to `0.3427818317946075`.
+  - The targeted D128 long causal shape regressed from `0.325743` to `0.301954`.
+- Issues:
+  - For the D128 2048 hz-major family, sync/mixed-CV hints alone are not enough; the positive behavior depends on the
+    full multi-buffer/workspace bundle.
+  - The source change was reverted, restoring the full CV parameter set on the `N_CTX=2048` branch.
+- Reports:
+  - `evaluation_reports/codex_point25_d128_2048_sync_params_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point25_d128_2048_sync_params_performance/evaluation_report.json`
