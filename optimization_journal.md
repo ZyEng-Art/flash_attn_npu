@@ -686,3 +686,46 @@
 - Reports:
   - `profiling_runs/codex_ir_point25_current_causal/_attn_fwd_last_pass.mlir`
   - `evaluation_reports/codex_point6_divisible_bounds_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 18: causal lazy UB kernel family regression
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 18, kernel splitting / kernel family specialization.
+- Content:
+  - Probed a specialized Triton kernel family for `causal and not USE_MAX and ACC_IN_UB`.
+  - Added an experimental `_attn_fwd_causal_lazy_ub` path with its own tile and loop helpers.
+  - The specialized path removed the generic `STAGE`, `USE_MAX`, and `ACC_IN_UB` branches from the kernel body and
+    skipped the dummy accumulator workspace allocation on the routed host path.
+  - The original `_attn_fwd` remained the fallback for stable softmax, GM-accumulator, and all non-causal cases.
+  - Reverted the source after performance validation because the change was negative.
+- Effect:
+  - Experimental source `python3 -m py_compile flash_attention_forward.py`: pass.
+  - Experimental source `git diff --check`: pass.
+  - Correctness suite for the experimental code: `18/18` passed in
+    `evaluation_reports/codex_point18_causal_lazy_ub_family_correctness/evaluation_report.json`.
+  - Performance suite for the experimental code: `6/6` matched in
+    `evaluation_reports/codex_point18_causal_lazy_ub_family_performance/evaluation_report.json`.
+  - Performance score regressed from the active divisible-boundary implementation `20.5003 / 60` to `19.7576 / 60`.
+  - Mean speedup regressed from `0.3416714652487010` to `0.3292927041946979`.
+  - Median speedup regressed from `0.3242350016847925` to `0.3133392780000467`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.256759 -> 0.250939`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.290876 -> 0.284306`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.278085 -> 0.268811`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.487924 -> 0.466441`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.357594 -> 0.342373`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.378791 -> 0.362887`.
+  - Final source after rollback `python3 -m py_compile flash_attention_forward.py`: pass.
+  - Final source after rollback `git diff --check`: pass.
+- Issues:
+  - The specialized family did not reduce latency on the targeted causal lazy UB cases. The copied narrow kernel likely
+    changed lowering enough to lose the generic helper's current scheduling balance, despite removing source-level
+    constexpr branches.
+  - Non-causal fallback cases also measured lower in the same run even though their source path was unchanged, so part of
+    the regression may be run-to-run variance. The two targeted causal cases still regressed directly and are sufficient
+    to reject the specialization.
+  - Keep the current generic `_attn_fwd` as the active implementation. A future kernel family attempt should specialize a
+    genuinely different algorithmic path rather than copying the current helper structure with fewer constexpr branches.
+- Reports:
+  - `evaluation_reports/codex_point18_causal_lazy_ub_family_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point18_causal_lazy_ub_family_performance/evaluation_report.json`
