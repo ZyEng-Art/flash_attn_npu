@@ -1320,3 +1320,42 @@
     fallback schedules are preserved, which the prior `USE_PCAST_DENOM` attempt did not.
 - Reports:
   - `evaluation_reports/codex_point18_d64_pcast_static_branch_correctness/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 11: D64 GM accumulator early-load regression
+
+- Commit: journal-only commit for this entry; source reverted to the post-`d009ba4` best implementation.
+- Optimization point: 11, load instruction reordering.
+- Content:
+  - Targeted the profiled long non-causal D64 wide-lazy-GM path where `aic_mte2_ratio`, `aic_scalar_ratio`, and
+    `aiv_scalar_ratio` are high while cube utilization remains near 99%.
+  - Moved the GM accumulator `tl.load(acc_ptr + block2d_acc)` earlier for `HEAD_DIM == 64` and `ACC_IN_UB == False`,
+    placing it before softmax denominator/update work instead of immediately before `tl.dot(p_cast, v)`.
+  - Kept D128/D256 source paths unchanged by using the existing `HEAD_DIM` constexpr as the family guard; no tiling,
+    workspace allocation, persistent program count, or math formula changed.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point11_d64_acc_prefetch_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point11_d64_acc_prefetch_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the post-`d009ba4` baseline `21.8243 / 60` to `20.8800 / 60`.
+  - Mean speedup regressed from `0.3637380100490856` to `0.3480005754314638`.
+  - Median speedup regressed from `0.3478055340771779` to `0.3398363101590597`.
+  - Per-shape speedups after the experiment:
+    - `(128, 8, 1024, 128, causal=True)`: `0.260925`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.283875`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.291915`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.432439`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.387757`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.431092`.
+- Issues:
+  - The targeted D64 long non-causal case itself regressed from baseline speedup `0.450285` to `0.431092`, so the
+    earlier accumulator load did not hide MTE2 latency.
+  - The likely cause is a worse schedule or larger live range across qk/softmax work; keeping K/V load and qk/softmax
+    ahead of the GM accumulator load is better for this kernel.
+  - Do not retry earlier accumulator prefetch for D64 unless IR shows the load can be issued without extending the
+    accumulator live range across the score tile.
+- Reports:
+  - `evaluation_reports/codex_point11_d64_acc_prefetch_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point11_d64_acc_prefetch_performance/evaluation_report.json`
