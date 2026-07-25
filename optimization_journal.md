@@ -1397,3 +1397,43 @@
 - Reports:
   - `evaluation_reports/codex_point18_d64_split_kernel_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point18_d64_split_kernel_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 17: D64 direct Q load boundary regression
+
+- Commit: journal-only commit for this entry; source reverted to the post-`d009ba4` best implementation.
+- Optimization point: 17, redundant boundary operation.
+- IR evidence:
+  - Current D64 non-causal IR:
+    `profiling_runs/codex_ir_point25_d64_noncausal_current/_attn_fwd_last_pass.mlir`.
+  - The current specialized IR is 461 lines, shorter than earlier generic/causal IR dumps, but it still contains a
+    residual boundary clamp.
+  - The suspicious residual is `_attn_fwd_last_pass.mlir:238`:
+    `%20 = arith.maxsi %19, %c0_i32 : i32`.
+  - The location maps to `flash_attention_forward.py:960`, where the Q block pointer uses
+    `offsets=(task_m_idx * BLOCK_M, 0)`.
+- Content:
+  - Added a `DIRECT_Q_LOAD` constexpr for only the D64 non-causal wide-lazy-GM family:
+    `head_dim == 64`, `BM == 128`, `BN == 256`, `causal == False`, `USE_MAX == False`, `ACC_IN_UB == False`.
+  - Replaced `tl.load(q_block_ptr)` with direct tensor-pointer addressing for Q:
+    `tl.load(Q + qvk_offset + offs_m[:, None] * stride_qm + q_cols[None, :] * stride_qk)`.
+  - Left all D128/D256 and causal families on the block-pointer path.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point17_d64_direct_q_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point17_d64_direct_q_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the post-`d009ba4` baseline `21.8243 / 60` to `21.1252 / 60`.
+  - Mean speedup regressed from `0.3637380100490856` to `0.35208703874440306`.
+  - Median speedup regressed from `0.34780553407717785` to `0.3394333592298998`.
+  - Target D64 long non-causal speedup regressed from `0.45028541645240344` to `0.42542172153069074`.
+- Issues:
+  - Direct pointer tensor loading removed or targeted the block-pointer boundary artifact, but it hurt the resulting
+    schedule enough to regress the target family.
+  - The block-pointer path likely enables better ND/NZ lowering and MTE planning than the direct tensor-pointer form.
+  - Do not retry direct Q tensor loading for this family without new IR evidence that the generated memory pipeline
+    improves.
+- Reports:
+  - `evaluation_reports/codex_point17_d64_direct_q_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point17_d64_direct_q_performance/evaluation_report.json`
