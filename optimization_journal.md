@@ -1293,3 +1293,30 @@
     to restore as a preset.
 - Reports:
   - Targeted same-process inline probe only; no evaluator report was generated because source was not changed.
+
+## 2026-07-25 - Optimization point 18: D64 p_cast denominator static-branch compile failure
+
+- Commit: journal-only commit for this entry; source reverted to `d009ba4`.
+- Optimization point: 18, kernel splitting / family specialization.
+- Content:
+  - Tried a lower-overhead version of the rejected D64 `p_cast` denominator family without adding a new kernel argument.
+  - Added a local static condition inside the lazy branch:
+    `if (not NEED_CAUSAL_MASK) and HEAD_DIM == 64 and BLOCK_N == 256 and (not ACC_IN_UB):`
+    then used `tl.sum(p_cast, axis=1)`, otherwise preserved `tl.sum(p, axis=1)`.
+  - Intended to avoid the fallback-schedule perturbation caused by threading a new `USE_PCAST_DENOM` constexpr through
+    the generic call stack.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass before NPU run.
+  - `git diff --check`: pass before NPU run.
+  - Correctness suite: `2/18` passed in
+    `evaluation_reports/codex_point18_d64_pcast_static_branch_correctness/evaluation_report.json`.
+  - Performance was not run because correctness failed.
+- Issues:
+  - Triton-Ascend front-end rejected the compound boolean condition with
+    `UnsupportedLanguageConstruct: chained boolean operators (A or B or C) are not supported`.
+  - This matches the earlier direct-prelude `tl.static_assert` failure class: chained boolean expressions are unsafe in
+    JIT code.
+  - Do not retry by adding more compound constexpr conditions inline. Use a host-provided single boolean only if IR shows
+    fallback schedules are preserved, which the prior `USE_PCAST_DENOM` attempt did not.
+- Reports:
+  - `evaluation_reports/codex_point18_d64_pcast_static_branch_correctness/evaluation_report.json`
