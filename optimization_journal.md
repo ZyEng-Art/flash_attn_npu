@@ -319,3 +319,31 @@
   - `profiling_runs/codex_ir_point25/_attn_fwd_last_pass.mlir`
   - `result_dir/profile_summary.txt`
   - `evaluation_reports/codex_point11_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 7: dedicated no-LSE kernel experiment
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 7, pass elimination / unused statistics-output elimination.
+- Content:
+  - Tried a separate `_attn_fwd_no_lse` launch path for the default `attention(..., return_lse=False)` API.
+  - Added a dedicated tile function that omitted the LSE tensor argument, skipped `m_i += tl.math.log(l_i)`, and skipped the `tl.store()` to the LSE buffer.
+  - Kept `return_lse=True` on the original `_attn_fwd` path so the public optional LSE behavior remained available.
+  - Reverted the code after performance validation because it was a negative optimization.
+- Effect:
+  - Correctness suite for the experimental code: `18/18` passed in `evaluation_reports/codex_point7_no_lse_kernel_correctness/evaluation_report.json`.
+  - Performance score regressed from the point 11 best `20.1515 / 60` to `19.5454 / 60`.
+  - Mean speedup regressed from point 11 `0.33585816600990115` to `0.325756944163873`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.2573 -> 0.2501`
+    - `(128, 8, 1024, 256, causal=True)`: `0.2712 -> 0.2660`
+    - `(128, 8, 2048, 128, causal=True)`: `0.2758 -> 0.2694`
+    - `(128, 8, 2048, 256, causal=False)`: `0.4768 -> 0.4673`
+    - `(128, 8, 4096, 128, causal=False)`: `0.3568 -> 0.3412`
+    - `(128, 8, 8192, 64, causal=False)`: `0.3773 -> 0.3606`
+- Issues:
+  - Removing the LSE side effect was not enough to compensate for the extra source duplication and separate compiled kernel shape; all six measured performance cases slowed down.
+  - This confirms the LSE store/log work is not the dominant bottleneck in the default path. The remaining time is still governed by the QK/PV loop, softmax vector/scalar chain, GM accumulator path for `HEAD_DIM=256`, and synchronization density.
+  - Final source after this entry is identical to the point 11 implementation.
+- Reports:
+  - `evaluation_reports/codex_point7_no_lse_kernel_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point7_no_lse_kernel_performance/evaluation_report.json`
