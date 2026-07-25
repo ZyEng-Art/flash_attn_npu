@@ -249,3 +249,29 @@
 - Reports:
   - `evaluation_reports/codex_tiling_perf_quick/`
   - `evaluation_reports/codex_point11_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 18: kernel splitting review
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 18, kernel splitting.
+- Content:
+  - Checked the mandatory kernel-splitting condition because the workload is multi-case and the best current mean speedup is below `0.8`.
+  - Did not add another split kernel. The current host path already dispatches per-shape `(BLOCK_M, BLOCK_N)` presets and per-shape lazy/stable softmax choices; these values are passed as `tl.constexpr`, so Triton compiles shape-specialized variants of `_attn_fwd`.
+  - Kept the single persistent kernel source because all six performance cases have `total_tiles > DEFAULT_PERSISTENT_PROGRAMS`, so the persistent loop is required for the scored large-grid cases.
+- Effect:
+  - No code changed, so the active implementation remains point 11.
+  - Best measured performance remains `20.1515 / 60`, mean speedup `0.33585816600990115`.
+  - Existing split-like dispatch evidence:
+    - `(128, 8, 1024, 128, causal=True)`: preset `(128, 64)`, lazy path.
+    - `(128, 8, 1024, 256, causal=True)`: preset `(64, 128)`, lazy path with GM accumulator.
+    - `(128, 8, 2048, 128, causal=True)`: preset `(64, 256)`, stable path.
+    - `(128, 8, 2048, 256, causal=False)`: preset `(128, 128)`, lazy path.
+    - `(128, 8, 4096, 128, causal=False)`: preset `(128, 256)`, stable path.
+    - `(128, 8, 8192, 64, causal=False)`: preset `(128, 256)`, stable path.
+- Issues:
+  - A separate source-level kernel per group would duplicate compile-time specialization already produced by `tl.constexpr` without removing the large-grid persistent loop.
+  - Removing the loop only helps tiny `total_tiles <= DEFAULT_PERSISTENT_PROGRAMS` correctness cases, not the scored performance cases.
+  - Further one-case-one-kernel splitting would increase maintenance and compile risk without a measured positive candidate.
+- Reports:
+  - `evaluation_reports/codex_point11_performance/evaluation_report.json`
+  - `evaluation_reports/codex_tiling_perf_quick/`
