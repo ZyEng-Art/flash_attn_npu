@@ -1607,6 +1607,12 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None):
             ACC_IN_UB=acc_in_ub,
             USE_MAX=use_max,
             ELIDE_UNUSED_MASK_INDEX=elide_unused_mask_index,
+            multibuffer=True,
+            enable_mixed_cv=True,
+            enable_auto_bind_sub_block=True,
+            sync_solver=True,
+            limit_auto_multi_buffer_of_local_buffer="no-limit",
+            set_workspace_multibuffer=2,
             debug=False,
         )
         return out, lse

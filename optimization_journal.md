@@ -1910,3 +1910,68 @@
 - Reports:
   - `evaluation_reports/codex_point12_d256_diag_hz_family_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point12_d256_diag_hz_family_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 25: D128 causal hz-major compile-param specialization
+
+- Commit: source + journal commit for this positive optimization.
+- Optimization point: 25, IR analysis optimization, applied through NPU CV-fusion compile parameters on the existing
+  point 12/18 D128 causal hz-major kernel family.
+- Motivation:
+  - The current D128 causal hz-major family profile for `(128, 8, 1024, 128, causal=True)` reports low MMAD share and
+    high scalar/MTE/sync pressure rather than a hard Cube limit: `aic_mac_ratio=0.129`, `aic_scalar_ratio=0.587`,
+    `aic_mte2_ratio=0.256`, `aiv_scalar_ratio=0.423`, with `cube_utilization(%)=99.542`.
+  - IR comparison showed the wrapper improved measured MTE2 locality despite increasing some remap/sync counts, so the
+    remaining actionable direction was to let the compiler's CV scheduler handle mixed Cube/Vector synchronization and
+    buffering more explicitly.
+  - To avoid perturbing fallback lowering, the experiment was restricted to the already-positive
+    `_attn_fwd_causal_hz_major` launch family.
+- Content:
+  - Tried the full FlashAttention CV parameter set from the Triton-Ascend compile-param guide:
+    `multibuffer=True`, `enable_mixed_cv=True`, `enable_auto_bind_sub_block=True`, `sync_solver=True`,
+    `limit_auto_multi_buffer_of_local_buffer="no-limit"`, `enable_flatten=False`, and `set_workspace_multibuffer=2`.
+  - Full set failed on the routed D128/head128 performance shapes because the local `bishengir-compile` does not accept
+    `--enable-flatten=False` and suggests `--enable-loop-flatten=False`; this environment exposes `enable_flatten` in
+    Python `NPUOptions`, but the backend lowers it to an unsupported compiler flag.
+  - Applied the compile-failure rollback by removing only `enable_flatten=False` and keeping the compatible CV parameters:
+    `multibuffer=True`, `enable_mixed_cv=True`, `enable_auto_bind_sub_block=True`, `sync_solver=True`,
+    `limit_auto_multi_buffer_of_local_buffer="no-limit"`, and `set_workspace_multibuffer=2`.
+  - Kept the change scoped to `_attn_fwd_causal_hz_major[grid]`; generic `_attn_fwd`, diag-split D256, tiling presets,
+    math, workspace policy, and `DEFAULT_PERSISTENT_PROGRAMS = 20` are unchanged.
+- Effect:
+  - Full parameter set:
+    - Correctness suite: `18/18` passed in
+      `evaluation_reports/codex_point25_hz_family_compile_params_correctness/evaluation_report.json`.
+    - Performance suite: only `4/6` matched in
+      `evaluation_reports/codex_point25_hz_family_compile_params_performance/evaluation_report.json`.
+    - The two routed D128/head128 cases failed compilation with
+      `Unknown command line argument '--enable-flatten=False'`, so that variant was rejected.
+  - Compatible parameter set:
+    - `python3 -m py_compile flash_attention_forward.py`: pass.
+    - `git diff --check`: pass.
+    - Correctness suite: `18/18` passed in
+      `evaluation_reports/codex_point25_hz_family_compile_params_v2_correctness/evaluation_report.json`.
+    - Performance suite: `6/6` matched in
+      `evaluation_reports/codex_point25_hz_family_compile_params_v2_performance/evaluation_report.json`.
+    - Submit-style performance score improved from the active best `22.33033509351132 / 60` to
+      `22.361347632011938 / 60`.
+    - Mean speedup improved from `0.37217225155852196` to `0.372689127200199`.
+    - Median speedup improved from `0.36062848394723923` to `0.36618297498563374`.
+    - Per-shape speedups after the compatible variant:
+      - `(128, 8, 1024, 128, causal=True)`: `0.286085` (active best was `0.286460`; roughly tied/slightly lower).
+      - `(128, 8, 1024, 256, causal=True)`: `0.289001` (active best was `0.291285`; fallback path, run variance).
+      - `(128, 8, 2048, 128, causal=True)`: `0.324891` (active best was `0.315776`; routed family improved).
+      - `(128, 8, 2048, 256, causal=False)`: `0.479278` (active best was `0.487401`; fallback path, run variance).
+      - `(128, 8, 4096, 128, causal=False)`: `0.407475` (active best was `0.405481`; fallback path).
+      - `(128, 8, 8192, 64, causal=False)`: `0.449406` (active best was `0.446629`; fallback path).
+- Issues:
+  - The gain is small and concentrated on the long D128 causal/head128 routed shape; the short D128 routed case is within
+    noise and slightly lower in this run.
+  - `enable_flatten` is unsafe in this environment despite being present in `NPUOptions`; do not use it unless the backend
+    flag mapping is updated or replaced with a proven supported option.
+  - The compile-param family still does not solve the larger D256 causal and long non-causal gaps. Next work should use
+    profile/IR evidence on those families rather than broadening this D128-only launch parameter set.
+- Reports:
+  - `evaluation_reports/codex_point25_hz_family_compile_params_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point25_hz_family_compile_params_performance/evaluation_report.json`
+  - `evaluation_reports/codex_point25_hz_family_compile_params_v2_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point25_hz_family_compile_params_v2_performance/evaluation_report.json`
