@@ -870,3 +870,27 @@
 - Reports:
   - `evaluation_reports/codex_point18_d256_diag_split_family_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point18_d256_diag_split_family_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 2: non-causal D256 resident-accumulator tiling probe
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 2, tiling optimization.
+- Content:
+  - Probed the non-causal D256 performance case `(128, 8, 2048, 256, causal=False)` with override
+    `(BM=64, BN=128)`.
+  - The current default for this shape is `(BM=128, BN=128)`, lazy softmax with a GM accumulator. The probe reused the
+    existing compile-safe D256 `(BM=64, BN=128)` resident-accumulator exception to test whether removing GM accumulator
+    load/store traffic can beat the extra query tiles.
+  - Did not modify source because the targeted same-session A/B was a clear regression.
+- Effect:
+  - Serial same-process A/B after avoiding concurrent NPU benchmark interference:
+    - Default `(BM=128, BN=128)`: median `72.162 ms`, min `72.131 ms`, CV `0.0005`.
+    - Probe `(BM=64, BN=128)`: median `87.835 ms`, min `87.786 ms`, CV `0.0008`.
+  - The probe is approximately `21.7%` slower than the active default on this targeted shape.
+- Issues:
+  - For non-causal D256, halving `BLOCK_M` doubles the number of query tiles. That added tile scheduling and Q-load work
+    dominates the saved GM accumulator traffic.
+  - Keep the D256 resident-accumulator exception routed only where it has already been measured positive:
+    the causal `(128, 8, 1024, 256, causal=True)` family.
+- Reports:
+  - Targeted same-process inline probe only; no evaluator report was generated because source was not changed.
