@@ -1531,3 +1531,49 @@
   - `profiling_runs/codex_ir_point25_d128_noncausal_current/_attn_fwd_last_pass.mlir`
   - `evaluation_reports/codex_point17_d128_direct_q_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point17_d128_direct_q_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 18: D64 non-causal pair-M K/V reuse family regression
+
+- Commit: journal-only commit for this entry; source was reverted after the regression.
+- Optimization point: 18, kernel splitting / family specialization.
+- Motivation:
+  - Prior profiling and IR evidence for the D64/D128 wide-lazy-GM families showed non-MMAD overhead:
+    `sync_block_set/wait`, `wait_flag/set_flag`, `pipe_barrier`, MTE/fixpipe and Vector/FlowCtrl pressure remain high.
+  - The target performance case `(Z=128, H=8, N_CTX=8192, HEAD_DIM=64, causal=False)` uses `(BM=128, BN=256)`
+    lazy softmax with GM accumulator. Each adjacent M tile streams the same K/V blocks independently in the generic path.
+  - Hypothesis: a D64-only family that processes two adjacent M tiles per task can load each K/V tile once and reuse it for
+    two Q tiles, reducing repeated GM K/V loads and some per-task synchronization overhead.
+- Content:
+  - Temporarily added `_attn_fwd_pair_m_tile` and `_attn_fwd_pair_m`.
+  - The specialized kernel was guarded to `HEAD_DIM == 64`, `BLOCK_M == 128`, `BLOCK_N == 256`, and
+    `N_CTX % (2 * BLOCK_M) == 0`.
+  - Host routing was intentionally narrow:
+    `not causal`, `head_dim == 64`, `n_ctx == 8192`, `BM == 128`, `BN == 256`, `USE_MAX == False`,
+    `ACC_IN_UB == False`.
+  - The pair-M tile loaded two Q blocks, loaded each K/V block once per `start_n`, computed two `QK/PV` pairs, and used
+    the same fp32 GM accumulator layout as the existing wide-lazy-GM path.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point18_d64_pair_m_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point18_d64_pair_m_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.11988352077489 / 60` to
+    `21.0847427384484 / 60`.
+  - Mean speedup regressed from `0.36866472534624817` to `0.35141237897414`.
+  - Median speedup regressed from `0.35471224516812827` to `0.3338406131340909`.
+  - Target D64 non-causal speedup regressed from `0.4455484950181382` to `0.43923267497851914`.
+  - Target D64 non-causal candidate median latency regressed from `505407.9801775515 us` to `513268.8395678997 us`.
+- Issues:
+  - K/V reuse did not compensate for the larger per-program live range: two Q tiles, two score tiles, two probability
+    tiles, two L accumulators, and two GM accumulator load/store streams likely increased register/UB/L0C pressure.
+  - Pairing M tiles also halves task granularity along M before persistent scheduling, which can hurt overlap and
+    scheduling even though the launched persistent program count remains 20.
+  - The implementation doubled dot work inside one loop body; this may worsen cube/vector synchronization and block
+    pointer scheduling instead of reducing the measured FlowCtrl/MTE pressure.
+  - Do not retry pair-M K/V reuse for the D64 wide-lazy-GM family without fresh simulator evidence showing K/V MTE is
+    dominant and that the larger fused task does not increase wait/barrier time.
+- Reports:
+  - `evaluation_reports/codex_point18_d64_pair_m_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point18_d64_pair_m_performance/evaluation_report.json`
