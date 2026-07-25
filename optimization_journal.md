@@ -1011,6 +1011,47 @@
   - `evaluation_reports/codex_point7_lazy_pcast_denominator_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point7_lazy_pcast_denominator_performance/evaluation_report.json`
 
+## 2026-07-25 - Optimization point 18: D64 p_cast denominator family regression
+
+- Commit: journal-only commit for this entry; source reverted to `d009ba4`.
+- Optimization point: 18, kernel splitting / family specialization.
+- Content:
+  - Followed up on the broad `p_cast` denominator probe, where only the long non-causal D64 case showed a small local
+    improvement.
+  - Added a `USE_PCAST_DENOM` `tl.constexpr` threaded through `_attn_fwd_inner_loop()` / `_attn_fwd_inner()` /
+    `_attn_fwd_tile()` / `_attn_fwd()`.
+  - Routed it to `True` only for the non-causal D64 wide-lazy-GM family:
+    `not causal and HEAD_DIM == 64 and BLOCK_M == 128 and BLOCK_N == 256 and not USE_MAX and not ACC_IN_UB`.
+  - All other generic and D256 causal diagonal-split paths passed `False`, preserving their math path at the source
+    level.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point18_d64_pcast_denom_family_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point18_d64_pcast_denom_family_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the post-`d009ba4` baseline `21.8243 / 60` to `21.0487 / 60`.
+  - Mean speedup regressed from `0.3637380100490856` to `0.3508123155726117`.
+  - Median speedup regressed from `0.3478055340771779` to `0.3390297263122239`.
+  - Per-shape speedups after the experiment:
+    - `(128, 8, 1024, 128, causal=True)`: `0.257651`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.277584`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.287600`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.468302`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.390460`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.423278`.
+- Issues:
+  - The extra constexpr and branch structure perturbed the generated generic kernel enough that fallback paths slowed even
+    though their `USE_PCAST_DENOM` value was `False`.
+  - The targeted D64 long non-causal case also lost in the isolated family run, so the local gain observed in the broad
+    probe was not robust.
+  - Do not add new denominator-selection constexpr plumbing unless it is backed by IR showing no fallback schedule
+    perturbation.
+- Reports:
+  - `evaluation_reports/codex_point18_d64_pcast_denom_family_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point18_d64_pcast_denom_family_performance/evaluation_report.json`
+
 ## 2026-07-25 - Optimization point 7: non-causal GM workspace empty-init regression
 
 - Commit: journal-only commit for this entry; source reverted to `d009ba4`.
