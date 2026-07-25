@@ -275,3 +275,47 @@
 - Reports:
   - `evaluation_reports/codex_point11_performance/evaluation_report.json`
   - `evaluation_reports/codex_tiling_perf_quick/`
+
+## 2026-07-25 - Optimization point 25: IR analysis review
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 25, IR analysis.
+- Content:
+  - Extracted Triton/Bisheng IR for the active point 11 implementation with:
+    `IR_OUTPUT_DIR=/workspace/new_attn/profiling_runs/codex_ir_point25 bash /workspace/cannbot-skills/ops/triton-latency-optimizer/scripts/run_and_extract.sh /workspace/new_attn/ir_trigger_attention.py`.
+  - The extraction produced valid compiler artifacts:
+    - `profiling_runs/codex_ir_point25/_attn_fwd_ttir.mlir` (`366` lines)
+    - `profiling_runs/codex_ir_point25/_attn_fwd_ttadapter.mlir` (`370` lines)
+    - `profiling_runs/codex_ir_point25/_attn_fwd_last_pass.mlir` (`709` lines)
+  - Reviewed `_attn_fwd_last_pass.mlir` after `ConvertHIVMToStandard` and found the expected MIX split:
+    `_attn_fwd_mix_aic` for Cube-side QK/PV dot work and `_attn_fwd_mix_aiv` for Vector-side softmax/output work.
+  - Counted the main lowered operations in the last-pass IR:
+    `nd2nz_half=9`, `mma_tile_half_to_float*=6`, `fixpipe_nz2nd_float_to_float_4d_to_2d=4`,
+    `load_gm_to_ubuf_1d_float=4`, `load_gm_to_ubuf_1d_half=2`,
+    `store_ubuf_to_gm_1d_half=6`, `store_ubuf_to_gm_1d_float=2`,
+    `vexp_1d_float=3`, `enablevc_reduce_sum_ar_float=3`, `vln_1d_float=2`, `vdiv_2d_float=2`,
+    `vcmp_ge_1d_float=2`, `vsel_vs_1d_float=2`,
+    `pipe_barrier=17`, `set_flag=41`, `wait_flag=41`, `sync_block_set=21`, `sync_block_wait=21`.
+  - Did not modify code. The IR confirms the remaining cost is a mix of Cube/FixPipe/GM workspace traffic,
+    Vector softmax normalization, and synchronization density; the actionable source-level levers from this evidence
+    are the same ones already tested.
+- Effect:
+  - No code changed, so the active implementation remains point 11.
+  - Best measured performance remains `20.1515 / 60`, mean speedup `0.33585816600990115`,
+    from `evaluation_reports/codex_point11_performance/evaluation_report.json`.
+  - The last-pass IR validates that point 11's GM accumulator load reordering targets a real GM workspace path in
+    `ACC_IN_UB == False`, while the earlier delayed-V-load variant removed useful MTE overlap and regressed.
+- Issues:
+  - The IR trigger run raised an NPU `507015` aicore exception during `torch.npu.synchronize()`. The compiler dump and
+    `bishengir-compile` extraction still completed, so this entry treats the IR as compile evidence only and not as a
+    correctness/performance run.
+  - The IR target spec in the dumped module reports Ascend910B-style sizes (`AI_CORE_COUNT=24`, `UB_SIZE=192KB`,
+    `L0C_SIZE=128KB`), so no 910_95-only L0C-to-UB rewrite was applied.
+  - Pass/store elimination corresponding to the softmax/LSE side was already tried in point 7 and regressed; widening
+    or changing tiling was already tried in point 2; extra kernel splitting was reviewed in point 18; scalar-width
+    cleanup from point 6 is already adopted.
+  - No new safe optimizer point remained after mapping the IR findings back to the completed experiments.
+- Reports:
+  - `profiling_runs/codex_ir_point25/_attn_fwd_last_pass.mlir`
+  - `result_dir/profile_summary.txt`
+  - `evaluation_reports/codex_point11_performance/evaluation_report.json`
