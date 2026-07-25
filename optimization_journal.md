@@ -1625,3 +1625,48 @@
 - Reports:
   - `evaluation_reports/codex_point1_unused_kv_zh_stride_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point1_unused_kv_zh_stride_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 1: unused qk_scale helper argument removal regression
+
+- Commit: journal-only commit for this entry; source was reverted after the regression.
+- Optimization point: 1, constexpr/static parameter simplification.
+- Motivation:
+  - The score scaling is already applied once via `q = (q * sm_scale).to(q.dtype)` before `tl.dot(q, tl.trans(k))`.
+  - `_attn_fwd_inner_loop()` and `_attn_fwd_inner()` still carried a `qk_scale` constexpr argument, but the only use was
+    the old commented line `# qk = qk * qk_scale`.
+  - Hypothesis: removing this unused helper argument would reduce inlined helper signature noise without changing the
+    top-level kernel launch ABI or math.
+- Content:
+  - Temporarily removed `qk_scale` from `_attn_fwd_inner_loop()` and `_attn_fwd_inner()`.
+  - Removed the corresponding `sm_scale` / `qk_scale` arguments from generic and causal diagonal-split helper calls.
+  - Removed the stale commented multiplication line.
+  - No top-level Triton kernel signature, host dispatch, tiling preset, workspace allocation, persistent program count, or
+    math formula was intentionally changed.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - `rg -n "qk_scale" flash_attention_forward.py`: no matches during the experiment.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point1_unused_qk_scale_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point1_unused_qk_scale_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.11988352077489 / 60` to
+    `21.04781972775779 / 60`.
+  - Mean speedup regressed from `0.36866472534624817` to `0.3507969954626299`.
+  - Median speedup regressed from `0.35471224516812827` to `0.33855521500512337`.
+  - Per-shape speedups after the experiment:
+    - `(128, 8, 1024, 128, causal=True)`: `0.257109`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.279809`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.287832`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.465397`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.389279`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.425357`.
+- Issues:
+  - Every performance shape regressed, so the helper signature shape itself is part of the current favorable lowering.
+  - This reinforces the previous unused K/V stride experiment: source-level simplification can perturb Triton-Ascend
+    schedule even when an argument is semantically unused.
+  - Do not remove unused helper constexpr arguments for this kernel without comparing `last_pass.mlir` and confirming the
+    resulting schedule is unchanged or better.
+- Reports:
+  - `evaluation_reports/codex_point1_unused_qk_scale_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point1_unused_qk_scale_performance/evaluation_report.json`
