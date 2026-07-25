@@ -175,3 +175,30 @@
 - Reports:
   - `evaluation_reports/codex_point7_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point7_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 11: delayed V tile load experiment
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 11, load instruction reordering.
+- Content:
+  - Tried moving `v = tl.load(v_block_ptr)` from the top of each KV-loop iteration to immediately before `tl.dot(p_cast, v)`.
+  - Kept `k` loading before `qk = tl.dot(q, tl.trans(k))`; only the independent `V` tile load was delayed.
+  - Reverted the code after performance validation because it was a negative optimization.
+- Effect:
+  - Correctness suite for the experimental code: `18/18` passed in `evaluation_reports/codex_point11_vload_late_correctness/evaluation_report.json`.
+  - Performance score regressed from point 11 `20.1515 / 60` to `18.3774 / 60`.
+  - Mean speedup regressed from `0.33585816600990115` to `0.3062896913098969`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.2573 -> 0.2413`
+    - `(128, 8, 1024, 256, causal=True)`: `0.2712 -> 0.2367`
+    - `(128, 8, 2048, 128, causal=True)`: `0.2758 -> 0.2350`
+    - `(128, 8, 2048, 256, causal=False)`: `0.4768 -> 0.4407`
+    - `(128, 8, 4096, 128, causal=False)`: `0.3568 -> 0.3249`
+    - `(128, 8, 8192, 64, causal=False)`: `0.3773 -> 0.3590`
+- Issues:
+  - Delaying `V` reduced its live range in source, but it removed useful MTE overlap before the `P@V` dot.
+  - The profiler-guided conclusion is to keep the earlier `K` and `V` prefetch order; the previous positive point 11 only moved the GM accumulator load ahead of `P@V`.
+  - Final source after this entry is identical to the committed point 11 implementation.
+- Reports:
+  - `evaluation_reports/codex_point11_vload_late_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point11_vload_late_performance/evaluation_report.json`
