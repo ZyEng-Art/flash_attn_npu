@@ -2060,3 +2060,45 @@
   - The source change was reverted; final code after this entry remains the positive D128 hz-major compile-param version.
 - Reports:
   - `evaluation_reports/codex_point25_fallback_compile_params_correctness/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 25: generic fallback sync-param regression
+
+- Commit: journal-only commit for this entry; source was reverted after the performance regression.
+- Optimization point: 25, IR analysis optimization, tested as the compile-failure rollback of the broader fallback
+  compile-param experiment.
+- Motivation:
+  - The broad fallback CV bundle failed correctness because `multibuffer`/workspace buffering caused CC overflow.
+  - Hypothesis: removing the capacity-heavy parameters and keeping only synchronization/scheduling hints might avoid the
+    overflow while still improving Cube/Vector coordination on fallback non-causal paths.
+- Content:
+  - Temporarily added only `enable_mixed_cv=True`, `enable_auto_bind_sub_block=True`, and `sync_solver=True` to the shared
+    `_attn_fwd[grid]` fallback launch.
+  - Omitted `multibuffer`, `limit_auto_multi_buffer_of_local_buffer`, `set_workspace_multibuffer`, and `enable_flatten`.
+  - Kept the existing D128 hz-major compile-param family unchanged.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point25_fallback_sync_params_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point25_fallback_sync_params_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.361347632011938 / 60` to
+    `21.482344699397753 / 60`.
+  - Mean speedup regressed from `0.372689127200199` to `0.35803907832329585`.
+  - Median speedup regressed from `0.36618297498563374` to `0.35110031584977613`.
+  - Per-shape speedups after the experiment:
+    - `(128, 8, 1024, 128, causal=True)`: `0.278009`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.276931`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.314855`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.467981`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.387346`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.423114`.
+- Issues:
+  - Removing multibuffer fixed the compile-capacity failure, but the remaining mixed-CV/sync hints still degraded the
+    shared fallback lowering across all measured performance shapes.
+  - This rules out generic fallback launch-parameter tuning. Any future non-causal optimization should be a narrower
+    kernel family with a structural source change and independent profile proof.
+  - The source change was reverted; final code after this entry remains the positive D128 hz-major compile-param version.
+- Reports:
+  - `evaluation_reports/codex_point25_fallback_sync_params_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point25_fallback_sync_params_performance/evaluation_report.json`
