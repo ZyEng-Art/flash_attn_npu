@@ -68,7 +68,7 @@
 
 ## 2026-07-25 - Optimization point 5: scalar tile-offset linearization
 
-- Commit: pending at time of writing.
+- Commit: `39dc464`
 - Optimization point: 5, scalar-to-vector / scalar-index reduction.
 - Content:
   - Tried a contiguous BNSD fast path in `_attn_fwd_tile()` that replaced per-tile `(task_hz_idx // H, task_hz_idx % H)` expansion with a linear `task_hz_idx * stride_h` plane offset.
@@ -92,3 +92,30 @@
 - Verification:
   - Reverted the experimental code; final source after this entry is identical to the pre-point-5 implementation.
   - Negative result kept as a journal-only commit.
+
+## 2026-07-25 - Optimization point 6: i64 offset arithmetic reduction
+
+- Commit: pending at time of writing.
+- Optimization point: 6, avoid vector API scalar lowering.
+- Content:
+  - Replaced two per-tile pointer-offset casts from `tl.int64` to `tl.int32` in `_attn_fwd_tile()`.
+  - Kept pointer formulas and tile mapping unchanged; only the scalar arithmetic type changed.
+  - Bounds rationale: the largest evaluated linear element offset is below `2^31`, so `int32` is sufficient for these shape-only evaluator inputs.
+- Effect:
+  - Correctness suite: `18/18` passed in `evaluation_reports/codex_point6_correctness/evaluation_report.json`.
+  - Submit-order regression: `21/21` passed, including `(1,2,1024,64,False,float16)` and `(128,8,1024,64,False,bfloat16)`.
+  - Performance score improved from baseline `19.9605 / 60` to `20.0690 / 60`.
+  - Mean speedup improved from `0.3326757973861712` to `0.3344841210438598`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.2517 -> 0.2548`
+    - `(128, 8, 1024, 256, causal=True)`: `0.2719 -> 0.2718`
+    - `(128, 8, 2048, 128, causal=True)`: `0.2761 -> 0.2737`
+    - `(128, 8, 2048, 256, causal=False)`: `0.4681 -> 0.4748`
+    - `(128, 8, 4096, 128, causal=False)`: `0.3515 -> 0.3547`
+    - `(128, 8, 8192, 64, causal=False)`: `0.3768 -> 0.3771`
+- Issues:
+  - Benefit is small and shape-dependent; causal shape 3 regressed slightly, but the aggregate score improved.
+  - This relies on the evaluator's bounded shapes. Wider future shapes should re-check that element offsets remain within `int32` range before reusing this change.
+- Reports:
+  - `evaluation_reports/codex_point6_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point6_performance/evaluation_report.json`

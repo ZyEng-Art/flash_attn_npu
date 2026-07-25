@@ -922,7 +922,7 @@ def _attn_fwd_tile(
         task_m_idx = linear_tile - task_hz_idx * num_tiles_m
     off_z = task_hz_idx // H
     off_h = task_hz_idx - off_z * H
-    qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+    qvk_offset = off_z.to(tl.int32) * stride_qz + off_h.to(tl.int32) * stride_qh
 
     q_block_ptr = tl.make_block_ptr(
         base=Q + qvk_offset,
@@ -970,7 +970,7 @@ def _attn_fwd_tile(
     if ACC_IN_UB:
         acc_ptr = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
     else:
-        acc_offset = (((off_z.to(tl.int64) * H + off_h.to(tl.int64)) * N_CTX + task_m_idx * BLOCK_M) * HEAD_DIM)
+        acc_offset = (((off_z.to(tl.int32) * H + off_h.to(tl.int32)) * N_CTX + task_m_idx * BLOCK_M) * HEAD_DIM)
         acc_ptr = acc + acc_offset
 
     tl.static_assert(N_CTX - (N_CTX // BLOCK_M) * BLOCK_M == 0)
