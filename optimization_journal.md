@@ -895,6 +895,46 @@
 - Reports:
   - Targeted same-process inline probe only; no evaluator report was generated because source was not changed.
 
+## 2026-07-25 - Optimization point 18: non-causal wide-lazy GM fp16 workspace probe
+
+- Commit: journal-only commit for this entry; source reverted to `d009ba4`.
+- Optimization point: 18, kernel splitting / family specialization.
+- Content:
+  - Tested a narrow non-causal wide-lazy-GM family change:
+    `acc_dtype = q.dtype if wide_lazy_gm and (not causal) else torch.float32`.
+  - The intended target was performance cases using `(BM=128, BN=256)` with GM accumulator workspace:
+    `(128, 8, 4096, 128, causal=False)` and `(128, 8, 8192, 64, causal=False)`.
+  - The hypothesis was that profile-reported MTE2/MTE3 plus scalar/control overhead might improve if the repeated
+    inter-iteration accumulator workspace load/store volume was halved.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point18_noncausal_gm_fp16_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point18_noncausal_gm_fp16_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the post-`d009ba4` baseline `21.8243 / 60` to `21.0981 / 60`.
+  - Mean speedup regressed from `0.3637380100490856` to `0.3516353979160472`.
+  - Median speedup regressed from `0.3478055340771779` to `0.3407773343533633`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.263030 -> 0.256630`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.288501 -> 0.278257`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.289713 -> 0.286274`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.485001 -> 0.462930`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.405898 -> 0.395280`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.450285 -> 0.430440`.
+- Issues:
+  - Despite reducing nominal GM workspace bytes for the targeted non-causal wide-lazy family, the target cases slowed
+    down. The likely cost is extra dtype conversion / lower-throughput load-store lowering around the accumulator
+    workspace, so MTE volume alone is not the current limiting factor.
+  - Non-targeted case movement is treated as benchmark noise or compile-cache perturbation, but the target cases were
+    clearly negative too.
+  - Do not retry low-precision GM accumulator storage unless a later profile proves MTE bandwidth dominates after other
+    scalar/control reductions.
+- Reports:
+  - `evaluation_reports/codex_point18_noncausal_gm_fp16_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point18_noncausal_gm_fp16_performance/evaluation_report.json`
+
 ## 2026-07-25 - Optimization point 9: exp2 softmax math replacement regression
 
 - Commit: journal-only commit for this entry.
