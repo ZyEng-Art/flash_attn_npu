@@ -166,7 +166,7 @@ DEFAULT_TILING_PRESETS = {
     (128, 8, 1024, 128, True): (128, 64),    # lazy
     (128, 8, 1024, 256, True): (64, 128),    # lazy (BM<BN)
     (128, 8, 2048, 128, True): (64, 256),    # stable, wide BN (BM<BN)
-    (128, 8, 2048, 256, False): (64, 128),   # lazy
+    (128, 8, 2048, 256, False): (128, 128),  # lazy
     (128, 8, 4096, 128, False): (128, 256),  # stable, wide BN
     (128, 8, 8192, 64, False): (128, 256),   # stable, wide BN
 }
@@ -654,7 +654,7 @@ def _attn_fwd_inner_loop(
     v_block_ptr,
     lo,
     hi,
-    qk_scale,
+    qk_scale: tl.constexpr,
     BLOCK_M: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -766,7 +766,7 @@ def _attn_fwd_inner(
     k_block_ptr,
     v_block_ptr,
     start_m,
-    qk_scale,
+    qk_scale: tl.constexpr,
     BLOCK_M: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -784,7 +784,7 @@ def _attn_fwd_inner(
         # mask). Works for any BLOCK_M/BLOCK_N (incl. BLOCK_M < BLOCK_N).
         stage_lo = 0
         stage_hi = start_m * BLOCK_M
-        full_hi = stage_hi - (stage_hi % BLOCK_N)
+        full_hi = (stage_hi // BLOCK_N) * BLOCK_N
         acc_ptr, l_i, m_i = _attn_fwd_inner_loop(
             acc_ptr,
             l_i,
@@ -816,7 +816,7 @@ def _attn_fwd_inner(
         # BLOCK_M >= BLOCK_N (a multiple) it reduces to [start_m*BM, (start_m+1)*BM).
         # When BLOCK_M < BLOCK_N a single wide key block straddles the diagonal and is
         # masked. Requires N_CTX % BLOCK_N == 0 so on_hi never exceeds N_CTX.
-        tl.static_assert(N_CTX % BLOCK_N == 0)
+        tl.static_assert(N_CTX - (N_CTX // BLOCK_N) * BLOCK_N == 0)
         stage_lo = tl.multiple_of((start_m * BLOCK_M // BLOCK_N) * BLOCK_N, BLOCK_N)
         stage_hi = (start_m + 1) * BLOCK_M
         full_hi = ((stage_hi + BLOCK_N - 1) // BLOCK_N) * BLOCK_N
@@ -844,7 +844,7 @@ def _attn_fwd_inner(
         return acc_ptr, l_i, m_i
 
     stage_lo = 0
-    full_hi = N_CTX - (N_CTX % BLOCK_N)
+    full_hi = (N_CTX // BLOCK_N) * BLOCK_N
     acc_ptr, l_i, m_i = _attn_fwd_inner_loop(
         acc_ptr,
         l_i,
@@ -877,7 +877,7 @@ def _attn_fwd_tile(
     M,
     Out,
     acc,
-    sm_scale,
+    sm_scale: tl.constexpr,
     stride_qz: tl.constexpr,
     stride_qh: tl.constexpr,
     stride_qm: tl.constexpr,
@@ -921,7 +921,7 @@ def _attn_fwd_tile(
         task_hz_idx = linear_tile // num_tiles_m
         task_m_idx = linear_tile - task_hz_idx * num_tiles_m
     off_z = task_hz_idx // H
-    off_h = task_hz_idx % H
+    off_h = task_hz_idx - off_z * H
     qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
 
     q_block_ptr = tl.make_block_ptr(
@@ -973,7 +973,7 @@ def _attn_fwd_tile(
         acc_offset = (((off_z.to(tl.int64) * H + off_h.to(tl.int64)) * N_CTX + task_m_idx * BLOCK_M) * HEAD_DIM)
         acc_ptr = acc + acc_offset
 
-    tl.static_assert(N_CTX % BLOCK_M == 0)
+    tl.static_assert(N_CTX - (N_CTX // BLOCK_M) * BLOCK_M == 0)
     q = tl.load(q_block_ptr)
     q = (q * sm_scale).to(q.dtype)
     if STAGE & 1:
@@ -1041,7 +1041,7 @@ def _attn_fwd(
     M,
     Out,
     acc,
-    sm_scale,
+    sm_scale: tl.constexpr,
     stride_qz: tl.constexpr,
     stride_qh: tl.constexpr,
     stride_qm: tl.constexpr,
