@@ -23,7 +23,7 @@
 
 ## 2026-07-25 - Optimization point 3: persistent program count sweep
 
-- Commit: pending at time of writing.
+- Commit: `f690f21`
 - Optimization point: 3, vector/core partitioning.
 - Content:
   - Swept `PERSISTENT_PROGRAMS` values `16`, `20`, `24`, and `32` on the six local performance shapes.
@@ -42,3 +42,26 @@
   - P24 and P32 are strongly negative on all tested performance shapes; P16 is consistently slower than P20.
 - Verification:
   - No code changed in this optimization point; this entry records the profiling result and rejects the negative alternatives.
+
+## 2026-07-25 - Optimization point 2: tiling sweep around tuned presets
+
+- Commit: pending at time of writing.
+- Optimization point: 2, tiling optimization.
+- Content:
+  - Swept targeted `(BLOCK_M, BLOCK_N)` candidates around the existing presets for all six performance shapes.
+  - Kept `DEFAULT_TILING_PRESETS` unchanged because the current presets were best or statistically tied within noise.
+  - Checked candidate output against `torch_npu.npu_fusion_attention` before timing each viable tiling.
+- Effect:
+  - `(128, 8, 1024, 128, causal=True)`: current `(128,64)` `11645.710 us`; `(64,128)` `12842.185 us`; `(64,256)` `11806.495 us`; `(128,128)` and `(128,256)` failed MLIR compilation.
+  - `(128, 8, 1024, 256, causal=True)`: current `(64,128)` `18112.785 us`; `(128,64)` `18132.870 us`; `(64,64)` `20702.840 us`; `(32,128)` `29881.350 us`; `(64,256)` failed MLIR compilation.
+  - `(128, 8, 2048, 128, causal=True)`: current `(64,256)` `37731.721 us`; `(128,64)` `40085.370 us`; `(64,128)` `43334.230 us`; `(128,128)` and `(128,256)` failed MLIR compilation.
+  - `(128, 8, 2048, 256, causal=False)`: current `(128,128)` `73214.190 us`; `(64,128)` `93422.750 us`; `(128,64)` `112174.865 us`; `(64,256)` and `(128,256)` failed MLIR compilation.
+  - `(128, 8, 4096, 128, causal=False)`: current `(128,256)` `172015.770 us`; `(128,128)` `205168.070 us`; `(64,256)` `216740.774 us`; `(64,128)` `302766.805 us`; `(256,64)` failed MLIR compilation.
+  - `(128, 8, 8192, 64, causal=False)`: current `(128,256)` `617161.525 us`; `(256,64)` `685005.235 us`; `(128,128)` `757361.920 us`; `(64,256)` `879657.120 us`; `(256,128)` failed MLIR compilation.
+  - Result: no code change. The current tiling table remains the best measured table in the targeted sweep.
+- Issues:
+  - Large square or very wide tiles often fail during MLIR lowering because the live `qk` and accumulator footprint overflows local storage.
+  - Some alternatives are close on one shape, but lose clearly on adjacent shapes or require a path that fails compilation elsewhere.
+- Verification:
+  - Viable candidates were output-checked against the NPU fusion attention baseline with `atol=1e-2`, `rtol=1e-2`.
+  - No code changed in this optimization point.
