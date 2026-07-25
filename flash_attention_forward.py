@@ -1573,6 +1573,44 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None):
         and (not use_max)
         and (not acc_in_ub)
     )
+    if use_causal_hz_major_family and n_ctx == 1024:
+        _attn_fwd_causal_hz_major[grid](
+            q,
+            k,
+            v,
+            lse,
+            out,
+            acc,
+            sm_scale,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            z,
+            h,
+            N_CTX=n_ctx,
+            HEAD_DIM=head_dim,
+            BLOCK_M=bm,
+            BLOCK_N=bn,
+            ACC_IN_UB=acc_in_ub,
+            USE_MAX=use_max,
+            ELIDE_UNUSED_MASK_INDEX=elide_unused_mask_index,
+            debug=False,
+        )
+        return out, lse
+
     if use_causal_hz_major_family:
         _attn_fwd_causal_hz_major[grid](
             q,

@@ -2102,3 +2102,55 @@
 - Reports:
   - `evaluation_reports/codex_point25_fallback_sync_params_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point25_fallback_sync_params_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 14: D128 causal compile-param strategy split
+
+- Commit: source + journal commit for this positive optimization.
+- Optimization point: 14, mixed strategy automatic selection, using shape-specific launch-parameter selection on the
+  existing D128 causal hz-major family.
+- Motivation:
+  - The previous D128 hz-major compile-param optimization improved the aggregate score, but its per-shape signal was
+    concentrated on `(128, 8, 2048, 128, causal=True)`.
+  - In that run, `(128, 8, 1024, 128, causal=True)` was roughly tied/slightly lower than the no-compile-param family, so
+    applying the CV parameter bundle to both D128 causal contexts was probably too broad.
+  - Hypothesis: route `N_CTX=1024` to the same hz-major family without explicit CV parameters while keeping `N_CTX=2048`
+    on the compatible CV parameter bundle.
+- Content:
+  - Added a host-side branch before the existing D128 causal hz-major launch:
+    `use_causal_hz_major_family and n_ctx == 1024` now calls `_attn_fwd_causal_hz_major[grid]` without CV launch
+    parameters.
+  - The existing `use_causal_hz_major_family` branch remains the `N_CTX=2048` path with:
+    `multibuffer=True`, `enable_mixed_cv=True`, `enable_auto_bind_sub_block=True`, `sync_solver=True`,
+    `limit_auto_multi_buffer_of_local_buffer="no-limit"`, and `set_workspace_multibuffer=2`.
+  - Did not use dynamic kwargs for Triton launch; arguments stay explicit to match the local code style and reduce runtime
+    dispatch risk.
+  - Generic `_attn_fwd`, D256 diag-split, tiling presets, math, workspace policy, and
+    `DEFAULT_PERSISTENT_PROGRAMS = 20` are unchanged.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point14_d128_compile_params_2048_only_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point14_d128_compile_params_2048_only_performance/evaluation_report.json`.
+  - Submit-style performance score improved from the active best `22.361347632011938 / 60` to
+    `22.400443902045232 / 60`.
+  - Mean speedup improved from `0.372689127200199` to `0.3733407317007539`.
+  - Median speedup improved from `0.36618297498563374` to `0.3668445691470613`.
+  - Per-shape speedups after the strategy split:
+    - `(128, 8, 1024, 128, causal=True)`: `0.286690`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.287265`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.325743`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.485639`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.407947`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.446762`.
+- Issues:
+  - The aggregate gain is small and partly within normal run variance on fallback non-causal shapes, but the full
+    evaluator score improved and correctness stayed at 100%.
+  - The duplicated launch argument list is intentional; using `**kwargs` for Triton launch was avoided because this file
+    does not already use that pattern.
+  - This confirms compile parameters should remain context-specific: `N_CTX=2048` D128 causal keeps the CV bundle, while
+    `N_CTX=1024` is better left on the no-parameter hz-major family.
+- Reports:
+  - `evaluation_reports/codex_point14_d128_compile_params_2048_only_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point14_d128_compile_params_2048_only_performance/evaluation_report.json`
