@@ -973,6 +973,44 @@
   - `evaluation_reports/codex_point7_lazy_log_skip_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point7_lazy_log_skip_performance/evaluation_report.json`
 
+## 2026-07-25 - Optimization point 7: broad lazy p_cast denominator regression
+
+- Commit: journal-only commit for this entry; source reverted to `d009ba4`.
+- Optimization point: 7, pass elimination / reuse already materialized cast probability tile.
+- Content:
+  - Changed only the lazy-softmax denominator update from `l_i += tl.sum(p, axis=1)` to
+    `l_i += tl.sum(p_cast, axis=1)`.
+  - The hypothesis was that numerator and denominator could share the same half/bfloat probability tile already used by
+    `tl.dot(p_cast, v)`, reducing fp32 Vector reduce pressure while staying within the evaluator tolerance.
+  - Stable online-softmax logic, tiling presets, accumulator residency, persistent-grid count, and host dispatch were not
+    changed.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point7_lazy_pcast_denominator_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point7_lazy_pcast_denominator_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the post-`d009ba4` baseline `21.8243 / 60` to `21.7180 / 60`.
+  - Mean speedup regressed from `0.3637380100490856` to `0.3619659982602839`.
+  - Median speedup changed from `0.3478055340771779` to `0.3488774565325008`.
+  - Per-shape speedups after the experiment:
+    - `(128, 8, 1024, 128, causal=True)`: `0.259911`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.285556`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.292320`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.475543`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.405435`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.453031`.
+- Issues:
+  - The broad approximation is correctness-safe locally but not performance-safe: D256 non-causal and several causal
+    paths lose enough to outweigh the small D64 long-shape gain.
+  - The only useful signal is the D64 non-causal wide-lazy-GM case, which improved slightly in this run. Any reuse of
+    this idea must be isolated behind a narrow kernel-family constexpr instead of changing the shared lazy path.
+  - Do not enable `p_cast` denominator broadly.
+- Reports:
+  - `evaluation_reports/codex_point7_lazy_pcast_denominator_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point7_lazy_pcast_denominator_performance/evaluation_report.json`
+
 ## 2026-07-25 - Optimization point 7: non-causal GM workspace empty-init regression
 
 - Commit: journal-only commit for this entry; source reverted to `d009ba4`.
