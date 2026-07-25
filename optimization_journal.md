@@ -640,3 +640,49 @@
   - `evaluation_reports/codex_point7_diag_split_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point7_diag_split_v2_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point7_diag_split_v2_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 25: current causal IR review
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 25, IR analysis.
+- Content:
+  - Extracted fresh Triton/Bisheng IR for the current best source on the causal performance shape
+    `(128, 8, 1024, 128, causal=True)` with:
+    `IR_OUTPUT_DIR=/workspace/new_attn/profiling_runs/codex_ir_point25_current_causal bash /workspace/cannbot-skills/ops/triton-latency-optimizer/scripts/run_and_extract.sh /workspace/new_attn/ir_trigger_attention.py`.
+  - The temporary `ir_trigger_attention.py` script was deleted after extraction and is not part of the final source.
+  - The extraction produced:
+    - `profiling_runs/codex_ir_point25_current_causal/_attn_fwd_ttir.mlir` (`345` lines).
+    - `profiling_runs/codex_ir_point25_current_causal/_attn_fwd_ttadapter.mlir` (`349` lines).
+    - `profiling_runs/codex_ir_point25_current_causal/_attn_fwd_last_pass.mlir` (`696` lines).
+- Effect:
+  - IR validation succeeded: `1/1` kernel validated and last-pass IR contains HIVM/LLVM operations.
+  - The trigger run itself raised `507015` aicore exception at `torch.npu.synchronize()`, but the compiler dump and
+    `bishengir-compile` extraction completed successfully. No benchmark result was taken from this run.
+  - Current causal last-pass summary:
+    - `scf.for`: `6`.
+    - `arith.divsi`: `6`.
+    - `arith.remsi`: `2`.
+    - `arith.index_cast`: `37`.
+    - `hivm.hir.sync_block_set`: `21`.
+    - `hivm.hir.sync_block_wait`: `21`.
+    - `hivm.hir.wait_flag`: `41`.
+    - `hivm.hir.set_flag`: `41`.
+    - `func.call @nd2nz_half`: `8`.
+    - `func.call @mma_tile_half_to_float_tb`: `2`.
+- Issues:
+  - Remaining `divsi/remsi` sites are dominated by persistent tile decomposition and `(z,h)` decomposition. Related
+    source-level rewrites were already tested:
+    - Point 5 linear contiguous tile offset fast path regressed all six performance cases.
+    - Point 6 tile-index int32 narrowing regressed all six performance cases.
+    - The positive point 6 divisible-boundary change already removed the safe causal boundary divide in the divisible
+      `BM >= BN` path.
+  - The IR shows heavy CUBE/VECTOR sync and workspace handoff, but mapped remedies have already been tested:
+    - GM accumulator load reordering was positive and kept.
+    - Narrow D256 resident accumulator was positive and kept.
+    - Broader D256 UB residency, reduced-M wide paths, and diagonal split were negative or failed lowering.
+  - No new safe optimization point was identified from this IR snapshot. Further progress likely needs either a different
+    algorithmic kernel family or profiler/simulator evidence for a specific pipeline bottleneck, not more blind scalar or
+    tiling rewrites.
+- Reports:
+  - `profiling_runs/codex_ir_point25_current_causal/_attn_fwd_last_pass.mlir`
+  - `evaluation_reports/codex_point6_divisible_bounds_performance/evaluation_report.json`
