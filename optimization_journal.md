@@ -45,7 +45,7 @@
 
 ## 2026-07-25 - Optimization point 2: tiling sweep around tuned presets
 
-- Commit: pending at time of writing.
+- Commit: `4eb3e71`
 - Optimization point: 2, tiling optimization.
 - Content:
   - Swept targeted `(BLOCK_M, BLOCK_N)` candidates around the existing presets for all six performance shapes.
@@ -65,3 +65,30 @@
 - Verification:
   - Viable candidates were output-checked against the NPU fusion attention baseline with `atol=1e-2`, `rtol=1e-2`.
   - No code changed in this optimization point.
+
+## 2026-07-25 - Optimization point 5: scalar tile-offset linearization
+
+- Commit: pending at time of writing.
+- Optimization point: 5, scalar-to-vector / scalar-index reduction.
+- Content:
+  - Tried a contiguous BNSD fast path in `_attn_fwd_tile()` that replaced per-tile `(task_hz_idx // H, task_hz_idx % H)` expansion with a linear `task_hz_idx * stride_h` plane offset.
+  - Preserved the original generic stride path behind a `ZH_CONTIGUOUS` constexpr branch during the experiment.
+  - Reverted the code after performance validation because it was a negative optimization.
+- Effect:
+  - Correctness suite: `18/18` passed in `evaluation_reports/codex_point5_correctness/evaluation_report.json`.
+  - Submit-order regression: `21/21` passed, including `(1,2,1024,64,False,float16)` and `(128,8,1024,64,False,bfloat16)`.
+  - Performance score regressed from baseline `19.9605 / 60` to `19.4807 / 60`.
+  - Mean speedup regressed from `0.3326757973861712` to `0.3246784782294558`.
+  - Per-shape speedups after the experiment:
+    - `(128, 8, 1024, 128, causal=True)`: `0.2521`
+    - `(128, 8, 1024, 256, causal=True)`: `0.2683`
+    - `(128, 8, 2048, 128, causal=True)`: `0.2690`
+    - `(128, 8, 2048, 256, causal=False)`: `0.4610`
+    - `(128, 8, 4096, 128, causal=False)`: `0.3390`
+    - `(128, 8, 8192, 64, causal=False)`: `0.3587`
+- Issues:
+  - Removing integer division from the source did not improve the generated kernel; the extra specialization path and changed scalar expression made all six measured performance cases slower.
+  - The board profiler's scalar pressure is dominated more by the softmax loop and control/dataflow than by the `(z,h)` tile offset arithmetic.
+- Verification:
+  - Reverted the experimental code; final source after this entry is identical to the pre-point-5 implementation.
+  - Negative result kept as a journal-only commit.
