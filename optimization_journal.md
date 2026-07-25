@@ -565,3 +565,38 @@
 - Reports:
   - `evaluation_reports/codex_point6_wide_bounds_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point6_wide_bounds_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 6: tile index int32 narrowing regression
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 6, avoid vector API scalar lowering / reduce int64 scalar address arithmetic.
+- Content:
+  - Probed narrowing `_attn_fwd_tile()`'s `task_m_idx` and `task_hz_idx` to `tl.int32` immediately after tile
+    decomposition.
+  - This made block-pointer offsets, `offs_m`, `m_ptrs`, and the `(z,h)` plane offset inherit int32 tile ids.
+  - Reverted the source after performance validation because the change was negative.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite for the experimental code: `18/18` passed in
+    `evaluation_reports/codex_point6_tile_index_i32_correctness/evaluation_report.json`.
+  - Performance suite for the experimental code: `6/6` matched in
+    `evaluation_reports/codex_point6_tile_index_i32_performance/evaluation_report.json`.
+  - Performance score regressed from the active divisible-boundary implementation `20.5003 / 60` to `20.1499 / 60`.
+  - Mean speedup regressed from `0.3416714652487010` to `0.3358319183697660`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.256759 -> 0.253418`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.290876 -> 0.283997`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.278085 -> 0.267219`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.487924 -> 0.484414`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.357594 -> 0.353448`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.378791 -> 0.372495`.
+- Issues:
+  - The earlier positive int32 cleanup only narrowed final pointer-offset terms. Narrowing the tile ids themselves changes
+    more scalar expressions, including block-pointer offsets and store indices, and appears to hurt lowering/scheduling.
+  - Keep `task_m_idx/task_hz_idx` in the original inferred type and only cast the final large pointer offset terms where
+    point 6 already showed a small positive effect.
+  - Final source after this entry remains the positive divisible-boundary implementation.
+- Reports:
+  - `evaluation_reports/codex_point6_tile_index_i32_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point6_tile_index_i32_performance/evaluation_report.json`
