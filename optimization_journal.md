@@ -347,3 +347,29 @@
 - Reports:
   - `evaluation_reports/codex_point7_no_lse_kernel_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point7_no_lse_kernel_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 7: force lazy softmax on wide-BN paths
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 7, pass elimination / online-softmax statistics elimination.
+- Content:
+  - Used the existing `FA_USE_MAX=0` runtime override to force the lazy non-stabilized softmax path on all six performance shapes before changing source code.
+  - The goal was to test whether the current `BLOCK_N=256` stable paths could drop the running max, alpha correction, and accumulator rescale.
+  - Did not modify code because the newly targeted wide-BN cases failed compilation.
+- Effect:
+  - Performance-only run: `3/6` matched in `evaluation_reports/codex_point7_force_lazy_performance/evaluation_report.json`.
+  - Aggregate score was invalid for adoption: `10.0894 / 60`, mean speedup `0.33631424024195883` over only the three successful shapes.
+  - Successful shapes were the ones already using lazy or equivalent small-BN paths:
+    - `(128, 8, 1024, 128, causal=True)`: speedup `0.2580`
+    - `(128, 8, 1024, 256, causal=True)`: speedup `0.2690`
+    - `(128, 8, 2048, 256, causal=False)`: speedup `0.4820`
+  - Newly targeted wide-BN shapes failed before timing:
+    - `(128, 8, 2048, 128, causal=True)`: UB overflow, requires `2375680` bits while `1572864` bits are available.
+    - `(128, 8, 4096, 128, causal=False)`: UB overflow `2105344 > 1572864` bits and CC overflow `1572864 > 1048576` bits.
+    - `(128, 8, 8192, 64, causal=False)`: UB overflow `2105344 > 1572864` bits and CC overflow `1310720 > 1048576` bits.
+- Issues:
+  - The earlier `_use_lazy(block_n <= 128)` guard is necessary for the current kernel shape. Enabling lazy for `BLOCK_N=256` increases live qk/P/V/acc pressure enough to exceed UB or CC.
+  - A source-level lazy widening patch would fail correctness/performance gating because three scored shapes would not compile.
+  - Future work must reduce tile footprint first, for example by chunking output/HEAD_DIM or changing the accumulation strategy, before retrying lazy on `BLOCK_N=256`.
+- Reports:
+  - `evaluation_reports/codex_point7_force_lazy_performance/evaluation_report.json`
