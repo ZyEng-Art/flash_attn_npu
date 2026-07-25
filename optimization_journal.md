@@ -373,3 +373,31 @@
   - Future work must reduce tile footprint first, for example by chunking output/HEAD_DIM or changing the accumulation strategy, before retrying lazy on `BLOCK_N=256`.
 - Reports:
   - `evaluation_reports/codex_point7_force_lazy_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 7: reduced-M wide-BN lazy softmax probe
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 7, pass elimination / online-softmax statistics elimination.
+- Content:
+  - Tested a narrower variant of the failed wide-BN lazy-softmax idea before changing source code.
+  - Instead of forcing lazy on the existing `(BM=128, BN=256)` long non-causal `HEAD_DIM=64` preset, the probe used
+    `attention(..., BM=64, BN=256)` with `FA_USE_MAX=0` for shape `(128, 8, 8192, 64, causal=False)`.
+  - The intent was to halve the QK tile M dimension so the lazy path could fit local storage, then remove the
+    online max/alpha accumulator-rescale pass for the longest performance case.
+  - Did not modify source because the targeted probe was already a clear regression.
+- Effect:
+  - Probe shape matched the NPU fusion attention reference: `torch.allclose=True`, `max_abs_diff=0.0001220703125`.
+  - Probe median timings with `warmup=2`, `iters=5`:
+    - Baseline `torch_npu.npu_fusion_attention`: `218177.3903 us`
+    - Triton candidate `BM=64, BN=256, lazy`: `765851.3496 us`
+    - Speedup vs baseline: `0.28488216467513744`
+  - This is slower than the active point 11 implementation for the same case, whose full performance report recorded
+    speedup `0.3772635825876341`.
+- Issues:
+  - Reducing `BLOCK_M` to make wide-BN lazy compile doubles the number of query tiles and loses much more than the
+    lazy-softmax pass elimination saves.
+  - The result confirms that, for the long `HEAD_DIM=64` non-causal case, the current `(BM=128, BN=256)` stable path is
+    still better than a reduced-M lazy path.
+  - Final source after this entry remains identical to the point 11 implementation.
+- Reports:
+  - Targeted inline probe only; no evaluator report was generated because source was not changed.
