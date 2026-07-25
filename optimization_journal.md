@@ -894,3 +894,32 @@
     the causal `(128, 8, 1024, 256, causal=True)` family.
 - Reports:
   - Targeted same-process inline probe only; no evaluator report was generated because source was not changed.
+
+## 2026-07-25 - Optimization point 2: causal D128 narrow-BN tiling recheck
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 2, tiling optimization.
+- Content:
+  - Rechecked the old causal D128 `(BM=128, BN=64)` and `(BM=64, BN=128)` candidates against the current implementation,
+    after the wide-lazy-GM policy and D256 diagonal family had been added.
+  - Targeted the two D128 causal performance cases:
+    `(128, 8, 1024, 128, causal=True)` and `(128, 8, 2048, 128, causal=True)`.
+  - Did not modify source because the active `(BM=64, BN=256)` preset remained best or tied in serial same-process A/B.
+- Effect:
+  - `(128, 8, 1024, 128, causal=True)`:
+    - Default `(BM=64, BN=256)`: median `11.344 ms`, min `11.326 ms`, CV `0.0011`.
+    - Probe `(BM=128, BN=64)`: median `11.544 ms`, min `11.515 ms`, CV `0.0009`.
+    - Probe `(BM=64, BN=128)`: median `12.753 ms`, min `12.721 ms`, CV `0.0034`.
+    - Repeated explicit `(BM=64, BN=256)`: median `11.361 ms`, min `11.295 ms`, CV `0.0021`.
+  - `(128, 8, 2048, 128, causal=True)`:
+    - Default `(BM=64, BN=256)`: median `36.008 ms`, min `35.922 ms`, CV `0.0009`.
+    - Probe `(BM=128, BN=64)`: median `39.856 ms`, min `39.826 ms`, CV `0.0035`.
+    - Probe `(BM=64, BN=128)`: median `43.468 ms`, min `43.453 ms`, CV `0.0006`.
+    - Repeated explicit `(BM=64, BN=256)`: median `35.906 ms`, min `35.874 ms`, CV `0.0009`.
+- Issues:
+  - The current D128 causal family is latency-bound by iteration count and synchronization density; reducing `BLOCK_N`
+    increases the number of KV-loop iterations too much.
+  - `(BM=128, BN=64)` keeps accumulator residency simpler but loses on the long causal case, so it is not robust enough
+    to restore as a preset.
+- Reports:
+  - Targeted same-process inline probe only; no evaluator report was generated because source was not changed.
