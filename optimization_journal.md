@@ -488,3 +488,44 @@
   - Final source after this entry remains the D256 causal `(BM=64, BN=128)` resident-accumulator implementation.
 - Reports:
   - Targeted inline probes only; no evaluator reports were generated because no source change was adopted.
+
+## 2026-07-25 - Optimization point 6: divisible causal boundary arithmetic
+
+- Commit: code commit for this entry.
+- Optimization point: 6, avoid vector API scalar lowering / avoid unnecessary integer divide in causal boundary setup.
+- Content:
+  - Added a compile-time specialization in `_attn_fwd_inner()` for causal off-band/on-band ranges when
+    `BLOCK_M` is an integer multiple of `BLOCK_N`.
+  - For those tiles, replaced the generic `floor/ceil(... / BLOCK_N) * BLOCK_N` boundary arithmetic with direct
+    `start_m * BLOCK_M` / `(start_m + 1) * BLOCK_M` expressions plus `tl.multiple_of()`.
+  - Kept the original generic formulas for `BLOCK_M < BLOCK_N` and non-divisible tiles, preserving the wide causal
+    paths that were introduced earlier for `BM < BN`.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point6_divisible_bounds_correctness/evaluation_report.json`.
+  - Submit-side sensitive spot checks passed:
+    - `torch.float16`, `(1, 2, 1024, 64, causal=False)`, `max_abs_diff=6.103515625e-05`.
+    - `torch.bfloat16`, `(128, 8, 1024, 64, causal=False)`, `max_abs_diff=0.0009765625`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point6_divisible_bounds_performance/evaluation_report.json`.
+  - Performance score improved from the previous full report `20.1904 / 60` to `20.5003 / 60`.
+  - Mean speedup improved from `0.3365067450863821` to `0.3416714652487010`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.253146 -> 0.256759`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.285737 -> 0.290876`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.272364 -> 0.278085`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.476586 -> 0.487924`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.354578 -> 0.357594`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.376630 -> 0.378791`.
+- Issues:
+  - The optimization is intentionally restricted to divisible causal tiles. Applying the direct boundary formula to
+    `BM < BN` would be incorrect because the diagonal block can straddle a wider key tile.
+  - Non-causal cases do not execute the specialized causal branches; their measured gains are likely from generated-code
+    simplification and normal benchmark noise, so the reliable rationale is the reduced causal integer arithmetic.
+  - The change does not touch persistent program count or device property probing, avoiding the earlier submit-side
+    `LazySetDevice` / `507033` failure mode.
+- Reports:
+  - `evaluation_reports/codex_point6_divisible_bounds_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point6_divisible_bounds_performance/evaluation_report.json`

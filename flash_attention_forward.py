@@ -788,7 +788,10 @@ def _attn_fwd_inner(
         # mask). Works for any BLOCK_M/BLOCK_N (incl. BLOCK_M < BLOCK_N).
         stage_lo = 0
         stage_hi = start_m * BLOCK_M
-        full_hi = (stage_hi // BLOCK_N) * BLOCK_N
+        if BLOCK_M >= BLOCK_N and (BLOCK_M // BLOCK_N) * BLOCK_N == BLOCK_M:
+            full_hi = tl.multiple_of(stage_hi, BLOCK_N)
+        else:
+            full_hi = (stage_hi // BLOCK_N) * BLOCK_N
         acc_ptr, l_i, m_i = _attn_fwd_inner_loop(
             acc_ptr,
             l_i,
@@ -821,9 +824,13 @@ def _attn_fwd_inner(
         # When BLOCK_M < BLOCK_N a single wide key block straddles the diagonal and is
         # masked. Requires N_CTX % BLOCK_N == 0 so on_hi never exceeds N_CTX.
         tl.static_assert(N_CTX - (N_CTX // BLOCK_N) * BLOCK_N == 0)
-        stage_lo = tl.multiple_of((start_m * BLOCK_M // BLOCK_N) * BLOCK_N, BLOCK_N)
         stage_hi = (start_m + 1) * BLOCK_M
-        full_hi = ((stage_hi + BLOCK_N - 1) // BLOCK_N) * BLOCK_N
+        if BLOCK_M >= BLOCK_N and (BLOCK_M // BLOCK_N) * BLOCK_N == BLOCK_M:
+            stage_lo = tl.multiple_of(start_m * BLOCK_M, BLOCK_N)
+            full_hi = tl.multiple_of(stage_hi, BLOCK_N)
+        else:
+            stage_lo = tl.multiple_of((start_m * BLOCK_M // BLOCK_N) * BLOCK_N, BLOCK_N)
+            full_hi = ((stage_hi + BLOCK_N - 1) // BLOCK_N) * BLOCK_N
         acc_ptr, l_i, m_i = _attn_fwd_inner_loop(
             acc_ptr,
             l_i,
