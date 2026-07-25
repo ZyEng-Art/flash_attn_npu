@@ -2019,3 +2019,44 @@
   - The source change was reverted; final code after this entry remains the positive D128 hz-major compile-param version.
 - Reports:
   - `evaluation_reports/codex_point25_d256_diag_compile_params_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 25: generic fallback compile-param regression
+
+- Commit: journal-only commit for this entry; source was reverted after the correctness regression.
+- Optimization point: 25, IR analysis optimization, tested by applying the compatible CV-fusion compile-parameter bundle
+  to the shared fallback `_attn_fwd[grid]` launch.
+- Motivation:
+  - The D128 causal hz-major family improved slightly with explicit CV scheduling parameters, so the next question was
+    whether the same compatible bundle could help the remaining fallback non-causal performance shapes.
+  - This was intentionally tested as a broad fallback experiment first to expose compile-capacity and correctness risks
+    before adding any new non-causal family split.
+- Content:
+  - Temporarily added to the generic `_attn_fwd[grid]` launch:
+    `multibuffer=True`, `enable_mixed_cv=True`, `enable_auto_bind_sub_block=True`, `sync_solver=True`,
+    `limit_auto_multi_buffer_of_local_buffer="no-limit"`, and `set_workspace_multibuffer=2`.
+  - Kept `enable_flatten` disabled/omitted because it is an unsupported compiler flag in this environment.
+  - Did not change `_attn_fwd_tile`, tiling presets, persistent program count, math, or the existing D128 hz-major
+    compile-param family.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite regressed to `12/18` in
+    `evaluation_reports/codex_point25_fallback_compile_params_correctness/evaluation_report.json`.
+  - Failed correctness shapes:
+    - `(1, 2, 1024, 64, causal=False)`.
+    - `(4, 32, 1024, 64, causal=False)`.
+    - `(4, 32, 1024, 128, causal=False)`.
+    - `(4, 32, 2048, 128, causal=False)`.
+    - `(4, 32, 4096, 64, causal=False)`.
+    - `(128, 8, 1024, 64, causal=False)`.
+  - All failures were compile-time `cc overflow`, requiring `2097152 bits` while only `1048576 bits` were available,
+    again pointing to multi-buffer extra local-buffer usage.
+  - Performance was not run because the correctness gate failed.
+- Issues:
+  - The shared fallback kernel has enough live CC/local-buffer pressure that the D128-only compile-param bundle cannot be
+    applied broadly.
+  - Future non-causal work must use narrower family splits and lower-footprint changes. A blanket compile-param pass is
+    not viable and would also re-break public correctness.
+  - The source change was reverted; final code after this entry remains the positive D128 hz-major compile-param version.
+- Reports:
+  - `evaluation_reports/codex_point25_fallback_compile_params_correctness/evaluation_report.json`
