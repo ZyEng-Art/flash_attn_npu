@@ -529,3 +529,39 @@
 - Reports:
   - `evaluation_reports/codex_point6_divisible_bounds_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point6_divisible_bounds_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 6: wide causal boundary arithmetic regression
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 6, avoid vector API scalar lowering / avoid unnecessary integer divide in causal boundary setup.
+- Content:
+  - Probed a second boundary-arithmetic specialization for causal `BM < BN` tiles where `BLOCK_N` is an integer multiple
+    of `BLOCK_M`.
+  - Rewrote the off-band/on-band boundaries through `query_tiles_per_kv = BLOCK_N // BLOCK_M`, e.g.
+    `(start_m // query_tiles_per_kv) * BLOCK_N`, while preserving the original formulas as the non-divisible fallback.
+  - Reverted the source after performance validation because the specialization was negative.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite for the experimental code: `18/18` passed in
+    `evaluation_reports/codex_point6_wide_bounds_correctness/evaluation_report.json`.
+  - Performance suite for the experimental code: `6/6` matched in
+    `evaluation_reports/codex_point6_wide_bounds_performance/evaluation_report.json`.
+  - Performance score regressed from the active divisible-boundary implementation `20.5003 / 60` to `19.3750 / 60`.
+  - Mean speedup regressed from `0.3416714652487010` to `0.3229174639021567`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.256759 -> 0.251807`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.290876 -> 0.283664`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.278085 -> 0.271768`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.487924 -> 0.426488`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.357594 -> 0.344504`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.378791 -> 0.359273`.
+- Issues:
+  - Although mathematically equivalent, the `BM < BN` specialization likely changes generated control/scalar IR enough to
+    worsen scheduling and register pressure. It also slowed non-causal specializations, suggesting the extra constexpr
+    branch shape affected shared generated code structure even when not executed at runtime.
+  - Do not repeat this wide-boundary rewrite unless IR evidence shows a different lowering strategy for it.
+  - Final source after this entry remains the previous positive divisible-boundary implementation.
+- Reports:
+  - `evaluation_reports/codex_point6_wide_bounds_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point6_wide_bounds_performance/evaluation_report.json`
