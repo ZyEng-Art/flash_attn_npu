@@ -1145,6 +1145,89 @@ def _attn_fwd(
 
 
 @triton.jit
+def _attn_fwd_causal_hz_major(
+    Q,
+    K,
+    V,
+    M,
+    Out,
+    acc,
+    sm_scale: tl.constexpr,
+    stride_qz: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qm: tl.constexpr,
+    stride_qk: tl.constexpr,
+    stride_kz: tl.constexpr,
+    stride_kh: tl.constexpr,
+    stride_kn: tl.constexpr,
+    stride_kk: tl.constexpr,
+    stride_vz: tl.constexpr,
+    stride_vh: tl.constexpr,
+    stride_vn: tl.constexpr,
+    stride_vk: tl.constexpr,
+    stride_oz: tl.constexpr,
+    stride_oh: tl.constexpr,
+    stride_om: tl.constexpr,
+    stride_on: tl.constexpr,
+    Z: tl.constexpr,
+    H: tl.constexpr,
+    N_CTX: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ACC_IN_UB: tl.constexpr,
+    USE_MAX: tl.constexpr,
+    ELIDE_UNUSED_MASK_INDEX: tl.constexpr,
+):
+    num_tiles_m = tl.cdiv(N_CTX, BLOCK_M)
+    total_tiles = num_tiles_m * Z * H
+    num_hz = Z * H
+    pid = tl.program_id(0)
+    program_count = tl.num_programs(0)
+
+    for linear_tile_hz in tl.range(pid, total_tiles, program_count):
+        task_hz_idx = linear_tile_hz // num_tiles_m
+        task_m_idx = linear_tile_hz - task_hz_idx * num_tiles_m
+        linear_tile_m = task_m_idx * num_hz + task_hz_idx
+        _attn_fwd_tile(
+            Q,
+            K,
+            V,
+            M,
+            Out,
+            acc,
+            sm_scale,
+            stride_qz,
+            stride_qh,
+            stride_qm,
+            stride_qk,
+            stride_kz,
+            stride_kh,
+            stride_kn,
+            stride_kk,
+            stride_vz,
+            stride_vh,
+            stride_vn,
+            stride_vk,
+            stride_oz,
+            stride_oh,
+            stride_om,
+            stride_on,
+            Z,
+            H,
+            N_CTX,
+            HEAD_DIM,
+            BLOCK_M,
+            BLOCK_N,
+            3,
+            ACC_IN_UB,
+            USE_MAX,
+            ELIDE_UNUSED_MASK_INDEX,
+            linear_tile_m,
+        )
+
+
+@triton.jit
 def _attn_fwd_causal_diag_split_tile(
     Q,
     K,
@@ -1478,6 +1561,55 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None):
         if acc_in_ub
         else torch.zeros((z, h, n_ctx, head_dim), dtype=torch.float32, device=q.device)
     )
+
+    use_causal_hz_major_family = (
+        causal
+        and z == 128
+        and h == 8
+        and head_dim == 128
+        and (n_ctx == 1024 or n_ctx == 2048)
+        and bm == 64
+        and bn == 256
+        and (not use_max)
+        and (not acc_in_ub)
+    )
+    if use_causal_hz_major_family:
+        _attn_fwd_causal_hz_major[grid](
+            q,
+            k,
+            v,
+            lse,
+            out,
+            acc,
+            sm_scale,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            z,
+            h,
+            N_CTX=n_ctx,
+            HEAD_DIM=head_dim,
+            BLOCK_M=bm,
+            BLOCK_N=bn,
+            ACC_IN_UB=acc_in_ub,
+            USE_MAX=use_max,
+            ELIDE_UNUSED_MASK_INDEX=elide_unused_mask_index,
+            debug=False,
+        )
+        return out, lse
 
     _attn_fwd[grid](
         q,

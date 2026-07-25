@@ -1808,3 +1808,58 @@
 - Reports:
   - `evaluation_reports/codex_point12_causal_hz_major_mapping_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point12_causal_hz_major_mapping_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 12/18: narrow D128 causal hz-major kernel family
+
+- Commit: source + journal commit for this positive optimization.
+- Optimization point: 12, grid shape and multi-path specialization; applied as point 18-style kernel family splitting
+  because the evaluator is multi-case and the generic path is still below the target speedup.
+- Motivation:
+  - The previous in-place causal hz-major mapping experiment improved two D128 causal/head128 shapes but regressed the
+    shared non-causal lowering, so the mapping itself had signal but was unsafe as a shared kernel edit.
+  - The D128 causal profile is scalar/MTE/sync-heavy (`aic_mac_ratio=0.123`, `aic_scalar_ratio=0.6087`,
+    `aic_mte2_ratio=0.3966`, `aiv_scalar_ratio=0.3845`), so changing persistent tile order can affect K/V locality and
+    scheduler balance without changing math.
+  - Hypothesis: a separate hz-major causal wrapper, routed only for the positive D128/head128 family, can keep the local
+    K/V locality gain while preserving the existing fallback lowering for all other cases.
+- Content:
+  - Added `_attn_fwd_causal_hz_major`, a dedicated wrapper kernel that iterates tiles in hz-major order and remaps each
+    hz-major tile id back to the m-major `linear_tile` consumed by the existing `_attn_fwd_tile` helper.
+  - Kept `_attn_fwd_tile` and the generic `_attn_fwd` source unchanged, avoiding schedule perturbation for fallback
+    non-causal and non-target causal paths.
+  - Added a narrow host dispatch guard for:
+    `causal=True`, `Z=128`, `H=8`, `HEAD_DIM=128`, `N_CTX in {1024, 2048}`, `BM=64`, `BN=256`,
+    `USE_MAX=False`, and `ACC_IN_UB=False`.
+  - Did not add dynamic NPU/core probing; `DEFAULT_PERSISTENT_PROGRAMS` remains `20`.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Checklist review:
+    - New Triton code uses one grid dimension through the existing launch path and no `break`/`continue`.
+    - No direct modulo was added; tile reindexing uses `a - (a / b) * b`.
+    - No new int64-dependent arithmetic, PyTorch fallback computation, or dynamic device-property probing was added.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point12_causal_hz_family_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point12_causal_hz_family_performance/evaluation_report.json`.
+  - Submit-style performance score improved from the active best `22.11988352077489 / 60` to
+    `22.33033509351132 / 60`.
+  - Mean speedup improved from `0.36866472534624817` to `0.37217225155852196`.
+  - Median speedup improved from `0.35471224516812827` to `0.36062848394723923`.
+  - Per-shape speedups after the experiment:
+    - `(128, 8, 1024, 128, causal=True)`: `0.286460` (active best was `0.270156`).
+    - `(128, 8, 1024, 256, causal=True)`: `0.291285` (active best was `0.293738`; not routed to the new family).
+    - `(128, 8, 2048, 128, causal=True)`: `0.315776` (active best was `0.299902`).
+    - `(128, 8, 2048, 256, causal=False)`: `0.487401` (active best was `0.493121`; fallback path, within run variance).
+    - `(128, 8, 4096, 128, causal=False)`: `0.405481` (active best was `0.409523`; fallback path, within run variance).
+    - `(128, 8, 8192, 64, causal=False)`: `0.446629` (active best was `0.445548`; fallback path).
+- Issues:
+  - This is a narrow family, not a general causal replacement. The D256 causal performance case previously regressed under
+    broad hz-major mapping and remains on the existing m-major fallback.
+  - The wrapper adds a little tile-index arithmetic before calling `_attn_fwd_tile`; the benefit still survives for the two
+    target D128/head128 shapes, but this pattern should not be expanded without full evaluator confirmation.
+  - The total score is still far from the externally reported 130-point ceiling; remaining work likely requires deeper
+    family specialization or IR/profile-driven reduction of scalar/MTE/sync instructions, not more broad source cleanup.
+- Reports:
+  - `evaluation_reports/codex_point12_causal_hz_family_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point12_causal_hz_family_performance/evaluation_report.json`
