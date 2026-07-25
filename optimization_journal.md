@@ -436,3 +436,23 @@
 - Reports:
   - `evaluation_reports/codex_point7_d256_acc_ub_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point7_d256_acc_ub_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 7: D256 causal wider-M accumulator UB boundary
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 7, pass elimination / repeated GM accumulator traffic elimination.
+- Content:
+  - Probed the adjacent causal D256 tile `(BM=128, BN=64)` with `ACC_UB_BUDGET=999999` and `FA_USE_MAX=0`.
+  - The goal was to see whether the resident-accumulator idea could use a larger M tile and fewer query blocks than the
+    adopted `(BM=64, BN=128)` path.
+  - Did not modify source because the probe failed during compilation.
+- Effect:
+  - Probe failed MLIR lowering before timing:
+    `cc overflow, requires 1310720 bits while 1048576 bits available`.
+  - No correctness or performance evaluator report was generated.
+- Issues:
+  - The `(BM=64, BN=128)` D256 resident-accumulator exception appears to be near the L0C/CC limit for this kernel shape.
+  - Increasing `BLOCK_M` while keeping the accumulator resident is not a viable next step; it triggers CC overflow.
+  - Final source after this entry remains the previous D256 `(BM=64, BN=128)` resident-accumulator implementation.
+- Reports:
+  - Targeted inline probe only; compilation failed before evaluator reporting.
