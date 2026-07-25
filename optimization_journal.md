@@ -1437,3 +1437,53 @@
 - Reports:
   - `evaluation_reports/codex_point17_d64_direct_q_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point17_d64_direct_q_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 17: D128 long causal off-band index elision
+
+- Commit: source + journal commit for this entry.
+- Optimization point: 17, redundant boundary/index operation elimination.
+- Evidence:
+  - Existing causal D128 pipe profiles show high scalar/MTE pressure rather than a pure MMAD limit:
+    - `profiling_runs/codex_pipe_causal_d128/profile_summary.json`:
+      `aic_scalar_ratio=0.5989`, `aic_mte2_ratio=0.3857`, `aiv_scalar_ratio=0.4198`.
+    - `profiling_runs/codex_pipe_causal_d256/profile_summary.json`:
+      `aic_scalar_ratio=0.5828`, `aic_mte2_ratio=0.4130`, `aiv_scalar_ratio=0.3769`.
+  - The earlier broad point17 hoist moved `curr_n = start_n + offs_n` under `if NEED_CAUSAL_MASK` for all non-mask
+    loops. It regressed the aggregate, but its per-shape data showed the long D128 causal case was slightly positive:
+    `(128, 8, 2048, 128, causal=True)` speedup `0.291400 -> 0.292313`.
+- Content:
+  - Reused the existing `ELIDE_UNUSED_MASK_INDEX` constexpr instead of adding a new kernel or rewriting the loop body.
+  - Added exactly one narrow family guard:
+    `causal and head_dim == 128 and n_ctx == 2048 and bm == 64 and bn == 256 and not USE_MAX and not ACC_IN_UB`.
+  - This skips materializing `curr_n` only in off-band D128 long causal loops where `NEED_CAUSAL_MASK == False`; the
+    diagonal masked loop still computes `curr_n` normally.
+  - Existing non-causal D256 mask-index elision remains unchanged.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Checklist review: no new Triton kernel arithmetic, grid change, int64 path, loop control, or task decomposition was
+    introduced; the change is host-side family dispatch only.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point17_d128_causal_index_elide_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point17_d128_causal_index_elide_performance/evaluation_report.json`.
+  - Submit-style performance score improved from the post-`d009ba4` baseline `21.8243 / 60` to `22.1199 / 60`.
+  - Mean speedup improved from `0.3637380100490856` to `0.36866472534624817`.
+  - Median speedup improved from `0.34780553407717785` to `0.35471224516812827`.
+  - Per-shape speedups after the experiment:
+    - `(128, 8, 1024, 128, causal=True)`: `0.270156`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.293738`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.299902`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.493121`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.409523`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.445548`.
+- Issues:
+  - Only the long D128 causal case is intentionally routed to the new behavior. Improvements on unrelated shapes are
+    likely run-to-run variance and should not be attributed to this guard.
+  - The long D64 non-causal case measured slightly below the post-`d009ba4` baseline in this run, but that source path is
+    unchanged.
+  - Keep this guard narrow. The broad point17 rewrite already showed that sharing the index elision across all non-mask
+    loops hurts the D64/D128 wide-lazy-GM families.
+- Reports:
+  - `evaluation_reports/codex_point17_d128_causal_index_elide_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point17_d128_causal_index_elide_performance/evaluation_report.json`

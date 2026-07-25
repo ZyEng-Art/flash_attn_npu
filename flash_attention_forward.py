@@ -1436,6 +1436,8 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None):
     acc_in_ub = False if wide_lazy_gm else _acc_in_ub(bm, head_dim, bn)
     elide_unused_mask_index = (
         (not causal) and head_dim == 256 and bm == 128 and bn == 128 and (not use_max) and (not acc_in_ub)
+    ) or (
+        causal and head_dim == 128 and n_ctx == 2048 and bm == 64 and bn == 256 and (not use_max) and (not acc_in_ub)
     )
     if causal and head_dim == 256 and bm == 64 and bn == 128 and (not use_max) and acc_in_ub:
         _attn_fwd_causal_diag_split[grid](
