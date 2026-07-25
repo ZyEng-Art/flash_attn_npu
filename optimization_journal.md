@@ -895,6 +895,47 @@
 - Reports:
   - Targeted same-process inline probe only; no evaluator report was generated because source was not changed.
 
+## 2026-07-25 - Optimization point 7: direct first-block GM accumulator init regression
+
+- Commit: journal-only commit for this entry; source reverted to `d009ba4`.
+- Optimization point: 7, pass elimination / accumulator workspace initialization and first-load elimination.
+- Content:
+  - Tried an `INIT_ACC_DIRECT` constexpr family for non-causal lazy-GM accumulator paths with `head_dim <= 128`.
+  - The intended replacement was to allocate the non-causal GM accumulator workspace with `torch.empty`, compute the
+    first KV block directly as `pv = tl.dot(p, v)`, store it to the workspace, then continue the remaining KV loop with
+    the existing GM load/add/store accumulation path.
+  - v1 added a `tl.static_assert` guard for the new constexpr combination and failed during front-end compilation.
+  - v2 removed the static assert but still failed correctness on every non-causal GM target family.
+  - v3 separated the first-block prelude from the remaining loop and returned early after the remaining accumulation;
+    it failed the same correctness cases as v2.
+- Effect:
+  - Static checks passed for the source shape after reverting the experiment.
+  - v1 correctness suite: `0/18` passed in
+    `evaluation_reports/codex_point7_direct_acc_init_correctness/evaluation_report.json`.
+  - v1 root cause: Triton-Ascend front-end rejected the chained boolean expression used inside `tl.static_assert`.
+  - v2 correctness suite: `12/18` passed in
+    `evaluation_reports/codex_point7_direct_acc_init_v2_correctness/evaluation_report.json`.
+  - v3 correctness suite: `12/18` passed in
+    `evaluation_reports/codex_point7_direct_acc_init_v3_correctness/evaluation_report.json`.
+  - Failed non-causal GM cases were identical in v2 and v3:
+    - `(1, 2, 1024, 64, causal=False)`: max diff `0.1124267578125`.
+    - `(4, 32, 1024, 64, causal=False)`: max diff `0.22607421875`.
+    - `(4, 32, 1024, 128, causal=False)`: max diff `0.8095703125`.
+    - `(4, 32, 2048, 128, causal=False)`: max diff `0.53076171875`.
+    - `(4, 32, 4096, 64, causal=False)`: max diff `0.09942626953125`.
+    - `(128, 8, 1024, 64, causal=False)`: max diff `0.2646484375`.
+- Issues:
+  - The direct first-block write is not equivalent under the current Triton-Ascend lowering, or the later GM
+    load/add/store path needs ordering/synchronization that this source-level prelude does not express.
+  - The failure remained after splitting the first block into a dedicated loop body, so this is not just a loop-bound
+    update bug.
+  - Do not retry this exact prelude without first inspecting generated IR/synchronization around `tl.store` followed by
+    subsequent `tl.load` from the same GM workspace.
+- Reports:
+  - `evaluation_reports/codex_point7_direct_acc_init_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point7_direct_acc_init_v2_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point7_direct_acc_init_v3_correctness/evaluation_report.json`
+
 ## 2026-07-25 - Optimization point 7: non-causal GM workspace empty-init regression
 
 - Commit: journal-only commit for this entry; source reverted to `d009ba4`.
