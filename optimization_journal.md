@@ -1718,3 +1718,46 @@
 - Reports:
   - `evaluation_reports/codex_point17_d128_1024_causal_index_elide_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point17_d128_1024_causal_index_elide_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 2: D128 causal BM32 tiling rejection
+
+- Commit: journal-only commit for this entry; no source change was made.
+- Optimization point: 2, tiling optimization.
+- Motivation:
+  - A fresh current-source profile for `(128, 8, 1024, 128, causal=True)` shows the kernel is not a pure MMAD limit:
+    `aic_mac_ratio=0.123`, `aic_scalar_ratio=0.6087`, `aic_mte2_ratio=0.3966`, `aiv_scalar_ratio=0.3845`.
+  - The active D128 causal preset uses `(BM=64, BN=256)` to reduce KV-loop iteration count, but the wide causal diagonal
+    tile also increases mask/vector pressure.
+  - Hypothesis: lowering `BM` to `32` while keeping wide `BN` might reduce per-tile Vector/scalar pressure enough to
+    offset the doubled number of M tiles.
+- Content:
+  - Ran a same-process targeted A/B probe on the two D128 causal performance shapes only.
+  - Candidates tested with `attention(..., BM=<candidate>, BN=<candidate>)`:
+    `(BM=32, BN=128)`, `(BM=32, BN=256)`, `(BM=64, BN=64)`, and `(BM=32, BN=64)`.
+  - Each candidate was compared against `torch_npu.npu_fusion_attention` first and only timed after passing
+    `torch.allclose(..., atol=1e-2, rtol=1e-2)`.
+  - No tiling preset, kernel code, persistent program count, or dispatch rule was changed.
+- Effect:
+  - Fresh profile path:
+    `profiling_runs/codex_pipe_current_d128_1024_causal/result_dir/profile_summary.json`.
+  - `(128, 8, 1024, 128, causal=True)`, median candidate latency:
+    - default `(BM=64, BN=256)`: `11515.780 us`;
+    - `(BM=32, BN=128)`: `22305.435 us`;
+    - `(BM=32, BN=256)`: `18861.290 us`;
+    - `(BM=64, BN=64)`: `18570.360 us`;
+    - `(BM=32, BN=64)`: `38129.830 us`.
+  - `(128, 8, 2048, 128, causal=True)`, median candidate latency:
+    - default `(BM=64, BN=256)`: `36124.399 us`;
+    - `(BM=32, BN=128)`: `74344.245 us`;
+    - `(BM=32, BN=256)`: `58784.245 us`;
+    - `(BM=64, BN=64)`: `66363.399 us`;
+    - `(BM=32, BN=64)`: `134978.745 us`.
+- Issues:
+  - The profile correctly identifies scalar/MTE pressure, but shrinking `BM` increases task count and synchronization
+    density too much. It also does not reduce the number of KV-loop iterations enough to compensate.
+  - This rules out a BM32 family for the D128 causal score cases under the current persistent scheduler.
+  - Keep the active `(BM=64, BN=256)` D128 causal preset; future causal work should target synchronization/source-shape
+    specialization rather than smaller M tiles.
+- Reports:
+  - `profiling_runs/codex_pipe_current_d128_1024_causal/result_dir/profile_summary.json`
+  - Targeted inline same-process timing probe; no evaluator report was generated because source was not changed.
