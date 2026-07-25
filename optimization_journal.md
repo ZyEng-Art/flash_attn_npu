@@ -1975,3 +1975,47 @@
   - `evaluation_reports/codex_point25_hz_family_compile_params_performance/evaluation_report.json`
   - `evaluation_reports/codex_point25_hz_family_compile_params_v2_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point25_hz_family_compile_params_v2_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 25: D256 causal diag-split compile-param regression
+
+- Commit: journal-only commit for this entry; source was reverted after the regression.
+- Optimization point: 25, IR analysis optimization, tested through the same compatible CV-fusion compile parameters used
+  by the positive D128 causal hz-major family.
+- Motivation:
+  - The D256 causal performance case remains one of the weakest score shapes.
+  - The previous D256 hz-major family failed, showing that tile-order locality is not enough and that m-major balancing is
+    important for diag-split.
+  - Hypothesis: keeping the existing diag-split tile order but enabling explicit CV compiler scheduling might reduce
+    scalar/MTE/sync overhead without changing the math or persistent traversal.
+- Content:
+  - Temporarily added the compatible CV parameter set to only `_attn_fwd_causal_diag_split[grid]`:
+    `multibuffer=True`, `enable_mixed_cv=True`, `enable_auto_bind_sub_block=True`, `sync_solver=True`,
+    `limit_auto_multi_buffer_of_local_buffer="no-limit"`, and `set_workspace_multibuffer=2`.
+  - Did not add `enable_flatten=False` because the D128 compile-param experiment already proved that the local backend
+    lowers it to unsupported `--enable-flatten=False`.
+  - Left `_attn_fwd_causal_hz_major`, generic `_attn_fwd`, tiling presets, workspace policy, and persistent program count
+    unchanged.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Performance suite: only `5/6` matched in
+    `evaluation_reports/codex_point25_d256_diag_compile_params_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.361347632011938 / 60` to
+    `18.67354498092374 / 60`.
+  - The targeted `(128, 8, 1024, 256, causal=True)` case failed compilation with CC overflow:
+    `requires 1572864 bits while 1048576 bits available`, with the compiler pointing to multi-buffer extra local buffer
+    usage as a possible reason.
+  - Other measured speedups in that run:
+    - `(128, 8, 1024, 128, causal=True)`: `0.277992`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.312730`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.464627`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.386391`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.425614`.
+- Issues:
+  - The D256 diag-split path is CC/register-pressure limited under this compile-parameter set; enabling multibuffer and
+    workspace multibuffer increases local-buffer demand beyond available capacity.
+  - This confirms D256 causal needs a lower-footprint inner-loop/kernel-family change, not the D128-compatible CV launch
+    parameter bundle.
+  - The source change was reverted; final code after this entry remains the positive D128 hz-major compile-param version.
+- Reports:
+  - `evaluation_reports/codex_point25_d256_diag_compile_params_performance/evaluation_report.json`
