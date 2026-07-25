@@ -974,6 +974,52 @@
   - `evaluation_reports/codex_point17_mask_index_hoist_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point17_mask_index_hoist_performance/evaluation_report.json`
 
+## 2026-07-25 - Optimization point 18: non-causal D256 mask-index-elision family
+
+- Commit: source + journal commit for this entry.
+- Optimization point: 18, kernel splitting / family specialization.
+- Content:
+  - Isolated the local win from the failed shared point 17 rewrite to the only measured positive family:
+    non-causal D256 `(HEAD_DIM=256, BM=128, BN=128, lazy softmax, GM accumulator)`.
+  - Added `ELIDE_UNUSED_MASK_INDEX` as a `tl.constexpr` parameter through `_attn_fwd_inner_loop()` / `_attn_fwd_inner()`
+    / `_attn_fwd_tile()` / `_attn_fwd()`.
+  - For all existing fallback families, this parameter is `False`, preserving the previous `curr_n = start_n + offs_n`
+    lowering. For the targeted non-causal D256 family only, it is `True`, so non-mask loops skip materializing the unused
+    `curr_n` vector.
+  - The existing D256 causal diagonal-split family explicitly passes `False` to avoid perturbing the previous positive
+    route.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Spot checks passed for:
+    - `(128, 8, 2048, 256, causal=False)`, max_abs_diff `0.0009765625`;
+    - `(128, 8, 1024, 256, causal=True)`, max_abs_diff `0.005859375`;
+    - `(128, 8, 8192, 64, causal=False)`, max_abs_diff `0.0001220703125`.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point18_d256_noncausal_index_family_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point18_d256_noncausal_index_family_performance/evaluation_report.json`.
+  - Performance score improved from the active D256 causal diagonal-split implementation `21.7645 / 60` to
+    `21.8296 / 60`.
+  - Mean speedup improved from `0.3627422138209748` to `0.3638264953797291`.
+  - Median speedup changed from `0.3505926638979259` to `0.3475630904125050`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.263565 -> 0.263960`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.291005 -> 0.289292`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.291400 -> 0.289679`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.470082 -> 0.485425`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.409785 -> 0.405447`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.450617 -> 0.449156`.
+- Issues:
+  - The aggregate gain is small (`+0.0651 / 60`) and comes almost entirely from the targeted non-causal D256 case.
+  - The shared point 17 rewrite was negative; keep this as a narrow constexpr family and do not enable it for long
+    wide-lazy-GM D64/D128 paths.
+  - The non-targeted shape movements should be treated as benchmark variance because their `ELIDE_UNUSED_MASK_INDEX`
+    value remains `False`.
+- Reports:
+  - `evaluation_reports/codex_point18_d256_noncausal_index_family_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point18_d256_noncausal_index_family_performance/evaluation_report.json`
+
 ## 2026-07-25 - Optimization point 2: causal D128 narrow-BN tiling recheck
 
 - Commit: journal-only commit for this entry.

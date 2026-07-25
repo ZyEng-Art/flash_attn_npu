@@ -680,6 +680,7 @@ def _attn_fwd_inner_loop(
     fp8_v: tl.constexpr,
     ACC_IN_UB: tl.constexpr,
     USE_MAX: tl.constexpr,
+    ELIDE_UNUSED_MASK_INDEX: tl.constexpr,
 ):
     k_block_ptr = tl.advance(k_block_ptr, (lo, 0))
     v_block_ptr = tl.advance(v_block_ptr, (lo, 0))
@@ -696,7 +697,8 @@ def _attn_fwd_inner_loop(
     
     for start_n in tl.range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-        curr_n = start_n + offs_n
+        if NEED_CAUSAL_MASK or not ELIDE_UNUSED_MASK_INDEX:
+            curr_n = start_n + offs_n
 
         k = tl.load(k_block_ptr)
         v = tl.load(v_block_ptr)
@@ -792,6 +794,7 @@ def _attn_fwd_inner(
     fp8_v: tl.constexpr,
     ACC_IN_UB: tl.constexpr,
     USE_MAX: tl.constexpr,
+    ELIDE_UNUSED_MASK_INDEX: tl.constexpr,
 ):
     if STAGE == 1:
         # Off-band (strictly below the diagonal block): key columns [0, off_hi) where
@@ -823,6 +826,7 @@ def _attn_fwd_inner(
             fp8_v,
             ACC_IN_UB,
             USE_MAX,
+            ELIDE_UNUSED_MASK_INDEX,
         )
         return acc_ptr, l_i, m_i
 
@@ -862,6 +866,7 @@ def _attn_fwd_inner(
             fp8_v,
             ACC_IN_UB,
             USE_MAX,
+            ELIDE_UNUSED_MASK_INDEX,
         )
         return acc_ptr, l_i, m_i
 
@@ -887,6 +892,7 @@ def _attn_fwd_inner(
         fp8_v,
         ACC_IN_UB,
         USE_MAX,
+        ELIDE_UNUSED_MASK_INDEX,
     )
     return acc_ptr, l_i, m_i
 
@@ -925,6 +931,7 @@ def _attn_fwd_tile(
     STAGE: tl.constexpr,
     ACC_IN_UB: tl.constexpr,
     USE_MAX: tl.constexpr,
+    ELIDE_UNUSED_MASK_INDEX: tl.constexpr,
     linear_tile,
 ):
     # Tile-to-core decomposition depends on STAGE (compile-time constant), trading off
@@ -1018,6 +1025,7 @@ def _attn_fwd_tile(
             V.dtype.element_ty == tl.float8e5,
             ACC_IN_UB,
             USE_MAX,
+            ELIDE_UNUSED_MASK_INDEX,
         )
     if STAGE & 2:
         acc_ptr, l_i, m_i = _attn_fwd_inner(
@@ -1039,6 +1047,7 @@ def _attn_fwd_tile(
             V.dtype.element_ty == tl.float8e5,
             ACC_IN_UB,
             USE_MAX,
+            ELIDE_UNUSED_MASK_INDEX,
         )
 
     m_i += tl.math.log(l_i)
@@ -1089,6 +1098,7 @@ def _attn_fwd(
     STAGE: tl.constexpr,
     ACC_IN_UB: tl.constexpr,
     USE_MAX: tl.constexpr,
+    ELIDE_UNUSED_MASK_INDEX: tl.constexpr,
 ):
     num_tiles_m = tl.cdiv(N_CTX, BLOCK_M)
     total_tiles = num_tiles_m * Z * H
@@ -1129,6 +1139,7 @@ def _attn_fwd(
             STAGE,
             ACC_IN_UB,
             USE_MAX,
+            ELIDE_UNUSED_MASK_INDEX,
             linear_tile,
         )
 
@@ -1259,6 +1270,7 @@ def _attn_fwd_causal_diag_split_tile(
         V.dtype.element_ty == tl.float8e5,
         True,
         False,
+        False,
     )
     acc_ptr, l_i, m_i = _attn_fwd_inner_loop(
         acc_ptr,
@@ -1280,6 +1292,7 @@ def _attn_fwd_causal_diag_split_tile(
         V.dtype.element_ty == tl.float8e5,
         True,
         False,
+        False,
     )
     acc_ptr, l_i, m_i = _attn_fwd_inner_loop(
         acc_ptr,
@@ -1300,6 +1313,7 @@ def _attn_fwd_causal_diag_split_tile(
         N_CTX,
         V.dtype.element_ty == tl.float8e5,
         True,
+        False,
         False,
     )
 
@@ -1420,6 +1434,9 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None):
     # Keep the fp32 accumulator in UB whenever it fits. The wide-lazy family is
     # intentionally excluded because lazy BN=256 overflows L0C when acc stays resident.
     acc_in_ub = False if wide_lazy_gm else _acc_in_ub(bm, head_dim, bn)
+    elide_unused_mask_index = (
+        (not causal) and head_dim == 256 and bm == 128 and bn == 128 and (not use_max) and (not acc_in_ub)
+    )
     if causal and head_dim == 256 and bm == 64 and bn == 128 and (not use_max) and acc_in_ub:
         _attn_fwd_causal_diag_split[grid](
             q,
@@ -1493,6 +1510,7 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None):
         STAGE=stage,
         ACC_IN_UB=acc_in_ub,
         USE_MAX=use_max,
+        ELIDE_UNUSED_MASK_INDEX=elide_unused_mask_index,
         debug=False,
     )
     return out, lse
