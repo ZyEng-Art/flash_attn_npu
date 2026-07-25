@@ -1487,3 +1487,47 @@
 - Reports:
   - `evaluation_reports/codex_point17_d128_causal_index_elide_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point17_d128_causal_index_elide_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 17: D128 non-causal direct Q load regression
+
+- Commit: journal-only commit for this entry; source was reverted after the regression.
+- Optimization point: 17, redundant boundary/index operation elimination.
+- Evidence:
+  - Fresh IR was extracted for the D128 non-causal long family using
+    `IR_OUTPUT_DIR=/workspace/new_attn/profiling_runs/codex_ir_point25_d128_noncausal_current`.
+  - The trigger shape was `(Z=128, H=8, N_CTX=4096, HEAD_DIM=128, causal=False)`.
+  - `_attn_fwd_last_pass.mlir` still contained a residual Q block-pointer boundary/index artifact:
+    `profiling_runs/codex_ir_point25_d128_noncausal_current/_attn_fwd_last_pass.mlir:236`,
+    `%20 = arith.maxsi %19, %c0_i32 : i32`.
+  - The location maps to `flash_attention_forward.py:960`, where the Q block pointer uses
+    `offsets=(task_m_idx * BLOCK_M, 0)`.
+- Content:
+  - Added a temporary `DIRECT_Q_LOAD` constexpr routed only to the D128 non-causal wide-lazy-GM family:
+    `head_dim == 128`, `n_ctx == 4096`, `BM == 128`, `BN == 256`, `causal == False`, `USE_MAX == False`,
+    `ACC_IN_UB == False`.
+  - Replaced `tl.load(q_block_ptr)` with direct tensor-pointer addressing for Q:
+    `tl.load(Q + qvk_offset + offs_m[:, None] * stride_qm + q_cols[None, :] * stride_qk)`.
+  - Left causal, D64, D256, and other D128 paths on the existing block-pointer load.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point17_d128_direct_q_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point17_d128_direct_q_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.11988352077489 / 60` to
+    `21.049980223715053 / 60`.
+  - Mean speedup regressed from `0.36866472534624817` to `0.35083300372858417`.
+  - Median speedup regressed from `0.35471224516812827` to `0.3381092144208627`.
+  - Target D128 non-causal speedup regressed from `0.4095227679` to `0.3883291104`.
+- Issues:
+  - The IR trigger raised NPU runtime error `507015` at `torch.npu.synchronize()`, so that run is treated only as
+    compile/IR evidence. Correctness and performance numbers above come from `evaluate_attention.py`.
+  - Direct tensor-pointer Q loading likely hurts block-pointer lowering, ND/NZ conversion, or MTE planning enough to
+    offset the removed boundary operation.
+  - This mirrors the earlier D64 direct-Q regression; do not retry direct Q tensor loading for wide-lazy-GM families
+    without evidence that the memory pipeline improves.
+- Reports:
+  - `profiling_runs/codex_ir_point25_d128_noncausal_current/_attn_fwd_last_pass.mlir`
+  - `evaluation_reports/codex_point17_d128_direct_q_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point17_d128_direct_q_performance/evaluation_report.json`
