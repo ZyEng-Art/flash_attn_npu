@@ -1577,3 +1577,51 @@
 - Reports:
   - `evaluation_reports/codex_point18_d64_pair_m_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point18_d64_pair_m_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 1: unused K/V z-h stride argument removal regression
+
+- Commit: journal-only commit for this entry; source was reverted after the regression.
+- Optimization point: 1, constexpr/static parameter simplification.
+- Motivation:
+  - `stride_kz`, `stride_kh`, `stride_vz`, and `stride_vh` were threaded through `_attn_fwd`,
+    `_attn_fwd_tile`, `_attn_fwd_causal_diag_split`, and `_attn_fwd_causal_diag_split_tile`, but the kernels compute
+    the shared B/H base offset from `stride_qz` and `stride_qh`.
+  - The current evaluator creates same-shape contiguous Q/K/V tensors, so removing these unused constexpr arguments
+    should preserve behavior while shrinking the kernel signature and scalar parameter plumbing.
+  - Hypothesis: fewer constexpr/scalar parameters might slightly reduce compile/runtime scalar setup noise and improve
+    the already scalar/sync-heavy profiles.
+- Content:
+  - Removed the four unused K/V z/h stride constexpr parameters from both generic and causal diagonal-split kernel
+    families.
+  - Removed the corresponding host-side positional arguments:
+    `k.stride(0)`, `k.stride(1)`, `v.stride(0)`, `v.stride(1)`.
+  - No tiling, math, workspace allocation, persistent program count, or routing behavior was changed.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - `rg -n "stride_kz|stride_kh|stride_vz|stride_vh" flash_attention_forward.py`: no matches during the experiment.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point1_unused_kv_zh_stride_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point1_unused_kv_zh_stride_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.11988352077489 / 60` to
+    `21.681339367536967 / 60`.
+  - Mean speedup regressed from `0.36866472534624817` to `0.36135565612561615`.
+  - Median speedup regressed from `0.35471224516812827` to `0.3473453111593829`.
+  - Per-shape speedups after the experiment:
+    - `(128, 8, 1024, 128, causal=True)`: `0.259803`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.285003`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.289274`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.482212`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.405417`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.446425`.
+- Issues:
+  - The D64 long non-causal case improved slightly in this run, but the three causal performance shapes regressed enough
+    to make the total score worse.
+  - Removing unused constexpr parameters changed the generated kernel signature/specialization and likely perturbed
+    compiler scheduling for causal paths; smaller source signatures are not automatically faster on Triton-Ascend.
+  - Keep the K/V z/h stride arguments unless future IR proves that a dedicated family can remove them without changing
+    the causal schedules.
+- Reports:
+  - `evaluation_reports/codex_point1_unused_kv_zh_stride_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point1_unused_kv_zh_stride_performance/evaluation_report.json`
