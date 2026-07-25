@@ -936,6 +936,43 @@
   - `evaluation_reports/codex_point7_direct_acc_init_v2_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point7_direct_acc_init_v3_correctness/evaluation_report.json`
 
+## 2026-07-25 - Optimization point 7: lazy LSE log-only suppression regression
+
+- Commit: journal-only commit for this entry; source reverted to `d009ba4`.
+- Optimization point: 7, pass elimination / unused statistics computation elimination.
+- Content:
+  - Tried a narrower follow-up to the previous LSE elimination experiments: keep the LSE tensor allocation and `tl.store`
+    unchanged, but skip the final `m_i += tl.math.log(l_i)` on lazy-softmax paths where `m_i` remains `-inf`.
+  - In the generic tile, this was implemented as `if USE_MAX: m_i += tl.math.log(l_i)`.
+  - In the D256 causal diagonal-split family, which is always lazy, the final `m_i += tl.math.log(l_i)` was removed.
+  - No tiling, accumulator residency, persistent-grid count, or host dispatch rule changed.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point7_lazy_log_skip_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point7_lazy_log_skip_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the post-`d009ba4` baseline `21.8243 / 60` to `21.0011 / 60`.
+  - Mean speedup regressed from `0.3637380100490856` to `0.3500176646030400`.
+  - Median speedup regressed from `0.3478055340771779` to `0.3373996572008339`.
+  - Per-shape speedups after the experiment:
+    - `(128, 8, 1024, 128, causal=True)`: `0.257490`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.279763`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.287520`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.462299`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.387279`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.425754`.
+- Issues:
+  - Even though the removed `log(l_i)` is semantically unused for the evaluator's default `return_lse=False` path and
+    lazy LSE values are already non-meaningful, removing it changed generated scheduling enough to slow the scored set.
+  - This confirms the previous no-LSE and store-only regressions were not just caused by LSE buffer allocation or store
+    removal; the LSE-side source shape itself appears to help current lowering balance.
+  - Do not retry lazy-only LSE/log suppression without IR evidence that the compiler preserves the favorable schedule.
+- Reports:
+  - `evaluation_reports/codex_point7_lazy_log_skip_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point7_lazy_log_skip_performance/evaluation_report.json`
+
 ## 2026-07-25 - Optimization point 7: non-causal GM workspace empty-init regression
 
 - Commit: journal-only commit for this entry; source reverted to `d009ba4`.
