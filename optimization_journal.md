@@ -2190,3 +2190,37 @@
 - Reports:
   - `evaluation_reports/codex_point25_d128_2048_sync_params_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point25_d128_2048_sync_params_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 25: D128 2048 multibuffer-only compile-param regression
+
+- Commit: journal-only commit for this entry; source was reverted after the regression.
+- Optimization point: 25, IR analysis optimization, evaluated as the complementary ablation of the positive D128 causal
+  2048 compile-parameter bundle.
+- Motivation:
+  - The sync-only ablation showed that `enable_mixed_cv + enable_auto_bind_sub_block + sync_solver` alone is not enough.
+  - Hypothesis: the benefit might instead come mostly from `multibuffer` and workspace multi-buffering, and removing the
+    mixed-CV/sync hints could simplify lowering while retaining MTE overlap.
+- Content:
+  - Temporarily kept only `multibuffer=True`, `limit_auto_multi_buffer_of_local_buffer="no-limit"`, and
+    `set_workspace_multibuffer=2` on the D128 `N_CTX=2048` hz-major launch.
+  - Temporarily removed `enable_mixed_cv=True`, `enable_auto_bind_sub_block=True`, and `sync_solver=True` from that branch.
+  - Left the D128 `N_CTX=1024` no-parameter branch and generic fallback paths unchanged.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point25_d128_2048_multibuffer_only_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point25_d128_2048_multibuffer_only_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.400443902045232 / 60` to
+    `22.324314587175813 / 60`.
+  - Mean speedup regressed from `0.3733407317007539` to `0.37207190978626353`.
+  - Median speedup was roughly tied/slightly lower: `0.3668445691470613` to `0.36678923310465283`.
+  - The targeted D128 long causal shape regressed from `0.325743` to `0.324044`.
+- Issues:
+  - The full bundle remains better than either half. The positive 2048 behavior appears to require both multi-buffering
+    and mixed-CV/sync scheduling together.
+  - The source change was reverted, restoring the full CV parameter set on the `N_CTX=2048` branch.
+- Reports:
+  - `evaluation_reports/codex_point25_d128_2048_multibuffer_only_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point25_d128_2048_multibuffer_only_performance/evaluation_report.json`
