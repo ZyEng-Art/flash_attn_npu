@@ -1359,3 +1359,41 @@
 - Reports:
   - `evaluation_reports/codex_point11_d64_acc_prefetch_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point11_d64_acc_prefetch_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 18: D64 non-causal split-kernel regression
+
+- Commit: journal-only commit for this entry; source reverted to the post-`d009ba4` best implementation.
+- Optimization point: 18, kernel splitting / family specialization.
+- Content:
+  - Added a dedicated non-causal D64 wide-lazy-GM kernel family for
+    `head_dim == 64`, `BM == 128`, `BN == 256`, `causal == False`, `USE_MAX == False`, `ACC_IN_UB == False`.
+  - The specialized tile inlined the generic lazy-GM math and removed compile-time branches for causal masking,
+    stable softmax, fp8 V, accumulator residency, and unused mask-index materialization.
+  - Host dispatch routed only this D64 family to the new kernel; all D128/D256 and causal families stayed on the existing
+    kernels.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point18_d64_split_kernel_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point18_d64_split_kernel_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the post-`d009ba4` baseline `21.8243 / 60` to `21.6273 / 60`.
+  - Mean speedup regressed from `0.3637380100490856` to `0.3604550558484402`.
+  - Median speedup regressed from `0.3478055340771779` to `0.3448207182527797`.
+  - Per-shape speedups after the experiment:
+    - `(128, 8, 1024, 128, causal=True)`: `0.256238`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.283854`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.282198`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.487722`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.405788`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.446931`.
+- Issues:
+  - The targeted D64 long non-causal case regressed from baseline speedup `0.450285` to `0.446931`.
+  - The generic kernel's constexpr-specialized path is already close to the manually split source for this family; the
+    extra kernel body and route did not produce better scheduling.
+  - Keep future point 18 work focused on cases where IR shows an actual generic-path residue, not just source-level
+    branch removal.
+- Reports:
+  - `evaluation_reports/codex_point18_d64_split_kernel_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point18_d64_split_kernel_performance/evaluation_report.json`
