@@ -1670,3 +1670,51 @@
 - Reports:
   - `evaluation_reports/codex_point1_unused_qk_scale_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point1_unused_qk_scale_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 17: D128 short causal off-band index elision regression
+
+- Commit: journal-only commit for this entry; source was reverted after the regression.
+- Optimization point: 17, redundant boundary/index operation elimination.
+- Motivation:
+  - The active best already routes the D128 long causal family
+    `(128, 8, 2048, 128, causal=True, BM=64, BN=256)` through `ELIDE_UNUSED_MASK_INDEX=True`.
+  - Existing causal profiles show high scalar/MTE pressure rather than a pure MMAD limit:
+    `aic_scalar_ratio≈0.5989`, `aic_mte2_ratio≈0.3857`, and `aiv_scalar_ratio≈0.4198` for the D128 causal profile.
+  - Hypothesis: the shorter D128 causal performance case
+    `(128, 8, 1024, 128, causal=True, BM=64, BN=256)` should benefit from the same off-band `curr_n` elision because
+    only masked diagonal loops need `curr_n = start_n + offs_n`.
+- Content:
+  - Temporarily widened the existing D128 causal guard from `n_ctx == 2048` to `n_ctx == 1024 or n_ctx == 2048`.
+  - Left non-causal D256 index elision, D256 causal diagonal split, all tiling presets, persistent program count, workspace
+    allocation, and math unchanged.
+  - No new Triton arithmetic, grid shape, loop control, or dynamic NPU/core probing was added.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Checklist review: host-side family dispatch only; the Triton checklist items for int64, comparison dtype, modulo,
+    one-dimensional grid, task partitioning, mutable loop offsets, and `break`/`continue` were unchanged.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point17_d128_1024_causal_index_elide_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point17_d128_1024_causal_index_elide_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.11988352077489 / 60` to
+    `21.578756970860205 / 60`.
+  - Mean speedup regressed from `0.36866472534624817` to `0.35964594951433676`.
+  - Median speedup regressed from `0.35471224516812827` to `0.34705502707939023`.
+  - Per-shape speedups after the experiment:
+    - `(128, 8, 1024, 128, causal=True)`: `0.259068`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.284168`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.289084`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.475495`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.405026`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.445034`.
+- Issues:
+  - The targeted short D128 causal case regressed from the active best `0.270156` to `0.259068`, so the long-D128
+    point17 win does not generalize to the shorter context.
+  - The long D128 causal case also measured lower in this run despite keeping the same source value as the active best,
+    which suggests the widened host constexpr/family expression perturbs kernel specialization or compile cache shape.
+  - Keep `ELIDE_UNUSED_MASK_INDEX=True` restricted to the already-validated `n_ctx == 2048` D128 causal family unless a
+    future MLIR comparison proves the shorter-context schedule is unchanged or better.
+- Reports:
+  - `evaluation_reports/codex_point17_d128_1024_causal_index_elide_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point17_d128_1024_causal_index_elide_performance/evaluation_report.json`
