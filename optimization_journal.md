@@ -122,7 +122,7 @@
 
 ## 2026-07-25 - Optimization point 11: GM accumulator load reordering
 
-- Commit: pending at time of writing.
+- Commit: `ac2423c`
 - Optimization point: 11, load instruction reordering.
 - Content:
   - In the `ACC_IN_UB == False` branches, moved `acc = tl.load(acc_ptr + block2d_acc)` before `pv = tl.dot(p_cast, v)`.
@@ -146,3 +146,32 @@
 - Reports:
   - `evaluation_reports/codex_point11_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point11_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 7: skip unused LSE output experiment
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 7, pass elimination / statistics-output elimination.
+- Content:
+  - Tried adding a `STORE_LSE: tl.constexpr` path through `_attn_fwd_tile()` and `_attn_fwd()`.
+  - Default `attention(..., return_lse=False)` allocated a scalar placeholder LSE tensor and skipped `m_i += tl.math.log(l_i)` plus the `tl.store()` to `M`.
+  - `attention(..., return_lse=True)` still kept the full `(Z, H, N_CTX)` LSE output and restored the lazy-softmax offset for `HEAD_DIM >= 256`.
+  - Reverted the code after performance validation because it was a negative optimization.
+- Effect:
+  - Correctness suite for the experimental code: `18/18` passed in `evaluation_reports/codex_point7_correctness/evaluation_report.json`.
+  - `return_lse=True` probe passed: output matched the reference, LSE shape was preserved, and LSE values were finite.
+  - Performance score regressed from point 11 `20.1515 / 60` to `19.5518 / 60`.
+  - Mean speedup regressed from `0.33585816600990115` to `0.32586353100098975`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.2573 -> 0.2476`
+    - `(128, 8, 1024, 256, causal=True)`: `0.2712 -> 0.2664`
+    - `(128, 8, 2048, 128, causal=True)`: `0.2758 -> 0.2692`
+    - `(128, 8, 2048, 256, causal=False)`: `0.4768 -> 0.4685`
+    - `(128, 8, 4096, 128, causal=False)`: `0.3568 -> 0.3398`
+    - `(128, 8, 8192, 64, causal=False)`: `0.3773 -> 0.3637`
+- Issues:
+  - Although the source eliminated an unused LSE store on the default API path, the extra constexpr specialization and control branch made every measured performance shape slower.
+  - The experiment also changed the private `_launch_kernel()` contract by making LSE allocation conditional, which is not worth carrying when the measured default path regresses.
+  - Final source after this entry is identical to the point 11 implementation.
+- Reports:
+  - `evaluation_reports/codex_point7_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point7_performance/evaluation_report.json`
