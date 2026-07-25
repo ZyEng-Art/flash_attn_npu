@@ -202,3 +202,31 @@
 - Reports:
   - `evaluation_reports/codex_point11_vload_late_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point11_vload_late_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 7: LSE store-only suppression experiment
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 7, pass elimination / unused output-store elimination.
+- Content:
+  - Tried a narrower version of the LSE elimination idea: keep the final `m_i += tl.math.log(l_i)` and keep full LSE allocation, but guard only the `tl.store()` to the LSE tensor behind `STORE_LSE: tl.constexpr`.
+  - Preserved `_launch_kernel()` default behavior with `store_lse=True`; only `attention(..., return_lse=False)` used `store_lse=False`.
+  - Reverted the code after performance validation because the aggregate score still regressed.
+- Effect:
+  - Correctness suite for the experimental code: `18/18` passed in `evaluation_reports/codex_point7_store_only_correctness/evaluation_report.json`.
+  - `return_lse=True` probe: default output matched between `return_lse=False` and `return_lse=True`, LSE shape was `(1, 1, 64)`, but LSE finite status remained false on the lazy path, matching the existing point 11 behavior rather than fixing LSE semantics.
+  - Performance score regressed from point 11 `20.1515 / 60` to `20.0566 / 60`.
+  - Mean speedup regressed from `0.33585816600990115` to `0.3342767015870253`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.2573 -> 0.2512`
+    - `(128, 8, 1024, 256, causal=True)`: `0.2712 -> 0.2775`
+    - `(128, 8, 2048, 128, causal=True)`: `0.2758 -> 0.2748`
+    - `(128, 8, 2048, 256, causal=False)`: `0.4768 -> 0.4910`
+    - `(128, 8, 4096, 128, causal=False)`: `0.3568 -> 0.3453`
+    - `(128, 8, 8192, 64, causal=False)`: `0.3773 -> 0.3658`
+- Issues:
+  - Removing only the LSE store helps two mid-size shapes, but slows the other four and loses on the aggregate score used by the evaluator.
+  - The full LSE store is small compared with the attention output store; suppressing it is not a reliable bottleneck fix for this workload.
+  - Final source after this entry is identical to the committed point 11 implementation.
+- Reports:
+  - `evaluation_reports/codex_point7_store_only_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point7_store_only_performance/evaluation_report.json`
