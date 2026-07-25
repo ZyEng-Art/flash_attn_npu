@@ -710,8 +710,8 @@ def _attn_fwd_inner_loop(
                 acc_ptr = acc_ptr * alpha[:, None]
                 acc_ptr = tl.dot(p_cast, v, acc_ptr)
             else:
-                pv = tl.dot(p_cast, v)
                 acc = tl.load(acc_ptr + block2d_acc)
+                pv = tl.dot(p_cast, v)
                 for slice_idx in range(4):
                     offset = slice_idx * (BLOCK_M // 4)
                     acc_i = extension.extract_slice(acc, (offset, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
@@ -746,8 +746,8 @@ def _attn_fwd_inner_loop(
                 else:
                     acc_ptr = acc_ptr + tl.dot(p_cast, v)
             else:
-                pv = tl.dot(p_cast, v)
                 acc = tl.load(acc_ptr + block2d_acc)
+                pv = tl.dot(p_cast, v)
                 acc = acc + pv
                 tl.store(acc_ptr + block2d_acc, acc)
 

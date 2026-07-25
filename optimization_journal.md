@@ -95,7 +95,7 @@
 
 ## 2026-07-25 - Optimization point 6: i64 offset arithmetic reduction
 
-- Commit: pending at time of writing.
+- Commit: `9b15b01`
 - Optimization point: 6, avoid vector API scalar lowering.
 - Content:
   - Replaced two per-tile pointer-offset casts from `tl.int64` to `tl.int32` in `_attn_fwd_tile()`.
@@ -119,3 +119,30 @@
 - Reports:
   - `evaluation_reports/codex_point6_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point6_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 11: GM accumulator load reordering
+
+- Commit: pending at time of writing.
+- Optimization point: 11, load instruction reordering.
+- Content:
+  - In the `ACC_IN_UB == False` branches, moved `acc = tl.load(acc_ptr + block2d_acc)` before `pv = tl.dot(p_cast, v)`.
+  - Kept K/V load order unchanged to preserve the existing prefetch behavior.
+  - Targeted only head_dim=256 GM accumulator paths; UB accumulator paths are unchanged.
+- Effect:
+  - Correctness suite: `18/18` passed in `evaluation_reports/codex_point11_correctness/evaluation_report.json`.
+  - Submit-order regression: `21/21` passed, including `(1,2,1024,64,False,float16)` and `(128,8,1024,64,False,bfloat16)`.
+  - Performance score improved from point 6 `20.0690 / 60` to `20.1515 / 60`.
+  - Mean speedup improved from `0.3344841210438598` to `0.33585816600990115`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.2548 -> 0.2573`
+    - `(128, 8, 1024, 256, causal=True)`: `0.2718 -> 0.2712`
+    - `(128, 8, 2048, 128, causal=True)`: `0.2737 -> 0.2758`
+    - `(128, 8, 2048, 256, causal=False)`: `0.4748 -> 0.4768`
+    - `(128, 8, 4096, 128, causal=False)`: `0.3547 -> 0.3568`
+    - `(128, 8, 8192, 64, causal=False)`: `0.3771 -> 0.3773`
+- Issues:
+  - The gain is small and close to run-to-run noise on shape 2, but the aggregate score improved.
+  - Keeping `v` loaded before `qk` remains intentional; moving it later would be a separate scheduling experiment because it trades MTE overlap for lower live range.
+- Reports:
+  - `evaluation_reports/codex_point11_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point11_performance/evaluation_report.json`
