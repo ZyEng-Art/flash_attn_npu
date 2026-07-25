@@ -456,3 +456,35 @@
   - Final source after this entry remains the previous D256 `(BM=64, BN=128)` resident-accumulator implementation.
 - Reports:
   - Targeted inline probe only; compilation failed before evaluator reporting.
+
+## 2026-07-25 - Optimization point 7: reduced-M wide path boundary probes
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 7, pass elimination / online-softmax or GM-accumulator traffic elimination.
+- Content:
+  - Probed additional reduced-M wide-tile variants after the positive D256 causal `(BM=64, BN=128)` result.
+  - The intent was to see whether shrinking `BLOCK_M` could free enough local storage to use either lazy softmax on
+    `BN=256` paths or resident accumulator on D256 paths without sacrificing too many query tiles.
+  - Did not modify source because every additional boundary probe was negative.
+- Effect:
+  - Non-causal D256 `(128, 8, 2048, 256, causal=False)` with `BM=64, BN=128`:
+    - Matched reference, `max_abs_diff=0.0009765625`.
+    - Probe median timings with `warmup=2`, `iters=5`: baseline `34861.2098 us`, candidate `89439.4405 us`,
+      speedup `0.38977446191731113`.
+    - Slower than the active default `(BM=128, BN=128)` path, whose latest full run recorded speedup `0.476586`.
+  - Non-causal D128 `(128, 8, 4096, 128, causal=False)` with `BM=64, BN=256`, `FA_USE_MAX=0`:
+    - Matched reference, `max_abs_diff=0.00048828125`.
+    - Probe median timings with `warmup=2`, `iters=5`: baseline `59819.7002 us`, candidate `214589.9106 us`,
+      speedup `0.2787628739591102`.
+    - Much slower than the active default `(BM=128, BN=256)` stable path.
+  - Causal D128 `(128, 8, 1024, 128, causal=True)` with `BM=64, BN=256`, `FA_USE_MAX=0`:
+    - Failed MLIR lowering before timing with UB overflow:
+      `requires 2375680 bits while 1572864 bits available`.
+- Issues:
+  - Shrinking `BLOCK_M` to make wide lazy/resident paths fit increases the number of query tiles enough to dominate any
+    saved online-softmax or GM accumulator work on these larger cases.
+  - Wide-BN lazy remains unsafe for the current source shape unless the live qk/P/V/acc footprint is reduced by a deeper
+    algorithmic change.
+  - Final source after this entry remains the D256 causal `(BM=64, BN=128)` resident-accumulator implementation.
+- Reports:
+  - Targeted inline probes only; no evaluator reports were generated because no source change was adopted.
