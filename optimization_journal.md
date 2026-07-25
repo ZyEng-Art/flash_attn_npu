@@ -230,3 +230,22 @@
 - Reports:
   - `evaluation_reports/codex_point7_store_only_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point7_store_only_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 13: autotune applicability check
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 13, autotune automatic tuning.
+- Content:
+  - Checked whether to replace the host-side `DEFAULT_TILING_PRESETS` and manual `(BLOCK_M, BLOCK_N)` dispatch with `@triton.autotune`.
+  - Did not modify code. The existing implementation already exposes the tunable parameters through `_resolve_tiling()` and uses offline measured presets for the evaluator shapes.
+  - Treated the earlier point 2 tiling sweep as the authoritative tuning data for this kernel.
+- Effect:
+  - No code changed, so the active implementation remains point 11.
+  - Best measured performance remains `20.1515 / 60`, mean speedup `0.33585816600990115`, from `evaluation_reports/codex_point11_performance/evaluation_report.json`.
+- Issues:
+  - The autotune reference states the advanced Triton-Ascend autotune path is limited to Vector-style kernels; this kernel is dominated by `tl.dot` Cube operations plus online-softmax Vector work.
+  - Running autotune inside the evaluator would add first-call tuning/compilation overhead and risks destabilizing the score path.
+  - Several larger tile candidates already failed MLIR lowering in the point 2 sweep, so a broad in-evaluator autotune space is likely to hit the same failures.
+- Reports:
+  - `evaluation_reports/codex_tiling_perf_quick/`
+  - `evaluation_reports/codex_point11_performance/evaluation_report.json`
