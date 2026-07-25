@@ -895,6 +895,54 @@
 - Reports:
   - Targeted same-process inline probe only; no evaluator report was generated because source was not changed.
 
+## 2026-07-25 - Optimization point 7: non-causal GM workspace empty-init regression
+
+- Commit: journal-only commit for this entry; source reverted to `d009ba4`.
+- Optimization point: 7, pass elimination / accumulator workspace initialization pass elimination.
+- Content:
+  - Tested replacing host-side fp32 GM accumulator `torch.zeros((z, h, n_ctx, head_dim))` with `torch.empty(...)` for
+    non-causal GM-accumulator paths.
+  - Added an experimental `INIT_ACC_IN_KERNEL` constexpr and, in `ACC_IN_UB == False` branches, used
+    `tl.where(start_n == 0, 0, loaded_acc)` so the first KV block initializes the accumulator inside the kernel.
+  - First broad version targeted all non-causal GM paths and exposed a D256 compile failure.
+  - Second narrowed version restricted the route to `head_dim <= 128` to avoid the D256 UB overflow and retested fully.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Broad version:
+    - Correctness suite: `18/18` passed in
+      `evaluation_reports/codex_point7_empty_acc_init_correctness/evaluation_report.json`.
+    - Performance suite: `5/6` matched in
+      `evaluation_reports/codex_point7_empty_acc_init_performance/evaluation_report.json`.
+    - D256 non-causal `(128, 8, 2048, 256, causal=False)` failed during lowering with UB overflow:
+      `requires 2101248 bits while 1572864 bits available`.
+  - Narrowed `head_dim <= 128` version:
+    - Correctness suite: `18/18` passed in
+      `evaluation_reports/codex_point7_empty_acc_init_d128d64_correctness/evaluation_report.json`.
+    - Performance suite: `6/6` matched in
+      `evaluation_reports/codex_point7_empty_acc_init_d128d64_performance/evaluation_report.json`.
+    - Submit-style performance score regressed from the post-`d009ba4` baseline `21.8243 / 60` to `21.0665 / 60`.
+    - Mean speedup regressed from `0.3637380100490856` to `0.3511085101470289`.
+    - Median speedup regressed from `0.3478055340771779` to `0.3375120255269046`.
+    - Per-shape speedups:
+      - `(128, 8, 1024, 128, causal=True)`: `0.263030 -> 0.254400`.
+      - `(128, 8, 1024, 256, causal=True)`: `0.288501 -> 0.275833`.
+      - `(128, 8, 2048, 128, causal=True)`: `0.289713 -> 0.286660`.
+      - `(128, 8, 2048, 256, causal=False)`: `0.485001 -> 0.470374`.
+      - `(128, 8, 4096, 128, causal=False)`: `0.405898 -> 0.388364`.
+      - `(128, 8, 8192, 64, causal=False)`: `0.450285 -> 0.431020`.
+- Issues:
+  - The broad version shows the extra zero-tile select can increase live UB enough to break D256 lowering.
+  - The narrowed version is still slower on the actual target non-causal D128/D64 cases, so the saved host zero-fill pass
+    does not compensate for additional kernel-side select/zero pressure and scheduling perturbation.
+  - Do not retry this exact `torch.empty + tl.where(start_n == 0)` pattern. A future attempt would need a separate
+    first-block loop body that avoids the GM load and avoids materializing a full zero tile.
+- Reports:
+  - `evaluation_reports/codex_point7_empty_acc_init_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point7_empty_acc_init_performance/evaluation_report.json`
+  - `evaluation_reports/codex_point7_empty_acc_init_d128d64_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point7_empty_acc_init_d128d64_performance/evaluation_report.json`
+
 ## 2026-07-25 - Optimization point 18: non-causal wide-lazy GM fp16 workspace probe
 
 - Commit: journal-only commit for this entry; source reverted to `d009ba4`.
