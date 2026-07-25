@@ -1761,3 +1761,50 @@
 - Reports:
   - `profiling_runs/codex_pipe_current_d128_1024_causal/result_dir/profile_summary.json`
   - Targeted inline same-process timing probe; no evaluator report was generated because source was not changed.
+
+## 2026-07-25 - Optimization point 12: causal hz-major mapping regression
+
+- Commit: journal-only commit for this entry; source was reverted after the regression.
+- Optimization point: 12, grid shape and multi-path specialization.
+- Motivation:
+  - The active `_attn_fwd_tile` already specializes tile-to-core mapping by `STAGE`: causal uses m-major assignment to
+    spread triangular causal work across persistent programs, while non-causal keeps hz-major assignment for K/V locality.
+  - The fresh D128 causal profile shows scalar/MTE/sync pressure rather than a pure MMAD limit:
+    `aic_mac_ratio=0.123`, `aic_scalar_ratio=0.6087`, `aic_mte2_ratio=0.3966`, `aiv_scalar_ratio=0.3845`.
+  - Hypothesis: making causal use hz-major assignment too could improve K/V locality and reduce MTE pressure enough to
+    offset the known triangular-work imbalance.
+- Content:
+  - Temporarily changed `_attn_fwd_tile` to always compute:
+    `task_hz_idx = linear_tile // num_tiles_m` and
+    `task_m_idx = linear_tile - task_hz_idx * num_tiles_m`.
+  - Removed the causal-only `STAGE == 3` m-major branch during the experiment.
+  - Left tiling presets, persistent program count, workspace allocation, math, index elision guards, and all other kernel
+    families unchanged.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point12_causal_hz_major_mapping_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point12_causal_hz_major_mapping_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.11988352077489 / 60` to
+    `21.485401518517186 / 60`.
+  - Mean speedup regressed from `0.36866472534624817` to `0.3580900253086198`.
+  - Median speedup regressed from `0.35471224516812827` to `0.34816019978979773`.
+  - Per-shape speedups after the experiment:
+    - `(128, 8, 1024, 128, causal=True)`: `0.276719` (better than active best `0.270156`).
+    - `(128, 8, 1024, 256, causal=True)`: `0.279126` (worse than active best `0.293738`).
+    - `(128, 8, 2048, 128, causal=True)`: `0.305744` (better than active best `0.299902`).
+    - `(128, 8, 2048, 256, causal=False)`: `0.470448` (worse than active best `0.493121`).
+    - `(128, 8, 4096, 128, causal=False)`: `0.390577` (worse than active best `0.409523`).
+    - `(128, 8, 8192, 64, causal=False)`: `0.425927` (worse than active best `0.445548`).
+- Issues:
+  - The source-level branch removal perturbed the shared non-causal lowering even though the intended behavior change was
+    causal-only; all non-causal performance shapes regressed.
+  - Causal hz-major is not uniformly positive: D128 causal 1024/128 and 2048/128 improved slightly, but 1024/256
+    regressed enough that the family is not safe as a broad causal replacement.
+  - Future point 12 work should use a separate kernel family or a much narrower host dispatch guard, not edit the shared
+    `_attn_fwd_tile` branch in place.
+- Reports:
+  - `evaluation_reports/codex_point12_causal_hz_major_mapping_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point12_causal_hz_major_mapping_performance/evaluation_report.json`
