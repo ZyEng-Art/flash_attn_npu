@@ -1863,3 +1863,50 @@
 - Reports:
   - `evaluation_reports/codex_point12_causal_hz_family_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point12_causal_hz_family_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 12/18: D256 causal diag-split hz-major family regression
+
+- Commit: journal-only commit for this entry; source was reverted after the regression.
+- Optimization point: 12, grid shape and multi-path specialization; evaluated as a point 18-style narrow kernel family.
+- Motivation:
+  - The D128 causal hz-major wrapper proved that tile-order specialization can improve scalar/MTE-heavy causal paths when
+    the target family is isolated from shared fallback lowering.
+  - The active D256 causal score case uses `_attn_fwd_causal_diag_split`, whose profile also shows non-MMAD pressure
+    (`aic_mac_ratio~0.138`, `aic_scalar_ratio~0.5828`, `aic_mte2_ratio~0.413`).
+  - Hypothesis: adding the same hz-major wrapper around the diag-split tile could improve K/V locality for
+    `(128, 8, 1024, 256, causal=True)` without changing the generic D128/non-causal paths.
+- Content:
+  - Temporarily added `_attn_fwd_causal_diag_split_hz_major`, mirroring the successful D128 wrapper pattern:
+    iterate `linear_tile_hz`, compute `(task_hz_idx, task_m_idx)`, remap to m-major `linear_tile_m`, and call the existing
+    `_attn_fwd_causal_diag_split_tile`.
+  - Temporarily routed only the D256 diag-split score shape
+    `Z=128,H=8,N_CTX=1024,HEAD_DIM=256,causal=True,BM=64,BN=128` to the new wrapper.
+  - Did not change tiling presets, persistent program count, generic `_attn_fwd`, D128 hz-major family, math, or
+    workspace policy.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point12_d256_diag_hz_family_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point12_d256_diag_hz_family_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.33033509351132 / 60` to
+    `21.300989487325936 / 60`.
+  - Mean speedup regressed from `0.37217225155852196` to `0.35501649145543224`.
+  - Median speedup regressed from `0.36062848394723923` to `0.3481486269270778`.
+  - Per-shape speedups after the experiment:
+    - `(128, 8, 1024, 128, causal=True)`: `0.274513` (active best was `0.286460`; D128 fallback/family changed only by
+      run variance, but measured lower in this full run).
+    - `(128, 8, 1024, 256, causal=True)`: `0.261613` (active best was `0.291285`; targeted D256 family regressed hard).
+    - `(128, 8, 2048, 128, causal=True)`: `0.304257` (active best was `0.315776`).
+    - `(128, 8, 2048, 256, causal=False)`: `0.469195` (active best was `0.487401`).
+    - `(128, 8, 4096, 128, causal=False)`: `0.392040` (active best was `0.405481`).
+    - `(128, 8, 8192, 64, causal=False)`: `0.428481` (active best was `0.446629`).
+- Issues:
+  - For D256 diag-split, m-major load balancing is more important than possible K/V locality from hz-major traversal.
+  - The target D256 case regressed from `0.291285` to `0.261613`, so this family must remain rejected.
+  - Future D256 causal work should target the diag-split inner-loop scalar/MTE/sync structure directly, not only persistent
+    tile order.
+- Reports:
+  - `evaluation_reports/codex_point12_d256_diag_hz_family_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point12_d256_diag_hz_family_performance/evaluation_report.json`
