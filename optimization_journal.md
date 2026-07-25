@@ -932,6 +932,48 @@
   - `evaluation_reports/codex_point9_exp2_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point9_exp2_performance/evaluation_report.json`
 
+## 2026-07-25 - Optimization point 17: non-mask loop index hoist regression
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 17, redundant boundary/index operation elimination.
+- Content:
+  - Re-profiled the current best long non-causal D64 case `(128, 8, 8192, 64, causal=False)` after the wide-lazy-GM and
+    D256 diagonal-split changes.
+  - Profiler summary for `_attn_fwd` in `result_dir/profile_summary.json`:
+    - average op time `502113.754 us`;
+    - `aic_scalar_ratio=0.643`, `aiv_scalar_ratio=0.397`;
+    - `aic_mac_ratio=0.135`, so the hot path is still scalar/control/vector-heavy rather than MMAD-bound.
+  - Tried moving `curr_n = start_n + offs_n` inside the `if NEED_CAUSAL_MASK:` branch in `_attn_fwd_inner_loop()` so
+    non-causal and off-band causal loops would not materialize an unused key-index vector.
+  - Reverted the source after validation because the aggregate performance regressed.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite for the experimental code: `18/18` passed in
+    `evaluation_reports/codex_point17_mask_index_hoist_correctness/evaluation_report.json`.
+  - Performance suite for the experimental code: `6/6` matched in
+    `evaluation_reports/codex_point17_mask_index_hoist_performance/evaluation_report.json`.
+  - Performance score regressed from the active D256 diagonal-split implementation `21.7645 / 60` to `21.3568 / 60`.
+  - Mean speedup regressed from `0.3627422138209748` to `0.3559461857670623`.
+  - Median speedup regressed from `0.3505926638979259` to `0.3367744330513599`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.263565 -> 0.258823`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.291005 -> 0.287339`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.291400 -> 0.292313`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.470082 -> 0.492325`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.409785 -> 0.381236`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.450617 -> 0.423641`.
+- Issues:
+  - The source-level redundant index removal appears to perturb lowering/scheduling more than it removes useful work.
+    The compiler may already eliminate or sink this expression in some constexpr variants.
+  - The fact that non-causal D256 improves but the long wide-lazy-GM shapes regress means this cannot be adopted as a
+    shared inner-loop change.
+  - A future retry would need a separate D256 non-causal family, not a common-loop rewrite.
+- Reports:
+  - `result_dir/profile_summary.json`
+  - `evaluation_reports/codex_point17_mask_index_hoist_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point17_mask_index_hoist_performance/evaluation_report.json`
+
 ## 2026-07-25 - Optimization point 2: causal D128 narrow-BN tiling recheck
 
 - Commit: journal-only commit for this entry.
