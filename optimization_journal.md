@@ -822,3 +822,51 @@
 - Reports:
   - `evaluation_reports/codex_point2_shape1_wide_lazy_gm_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point2_shape1_wide_lazy_gm_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 18: D256 causal diagonal-split kernel family
+
+- Commit: source + journal commit for this entry.
+- Optimization point: 18, kernel splitting / family specialization.
+- Content:
+  - Added a dedicated `_attn_fwd_causal_diag_split` family for the D256 causal lazy-UB route:
+    `causal and HEAD_DIM == 256 and BLOCK_M == 64 and BLOCK_N == 128 and not USE_MAX and ACC_IN_UB`.
+  - The fallback `_attn_fwd` remains unchanged for all other cases.
+  - The specialized tile keeps the existing persistent 1D grid and m-major causal tile mapping, but splits the
+    causal on-band work into:
+    - wide fully-valid off-band `BLOCK_N=128` chunks;
+    - an optional `BLOCK_M=64` prefix chunk inside the current wide key block;
+    - a `BLOCK_M=64` masked diagonal chunk.
+  - This isolates the earlier diagonal-split idea to the one shape family where prior full-kernel probing showed local
+    upside, avoiding the known long-D128 causal regression.
+  - The specialized route skips the dummy accumulator workspace allocation because the D256 route keeps the accumulator
+    resident in UB.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - D256 causal spot check through `evaluate_attention.run_correctness_case()`:
+    `(128, 8, 1024, 256, causal=True, fp16)` passed with `max_abs_diff=0.0029296875`.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point18_d256_diag_split_family_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point18_d256_diag_split_family_performance/evaluation_report.json`.
+  - Performance score improved from the active causal-D128 wide-lazy-GM preset implementation `21.0501 / 60` to
+    `21.7645 / 60`.
+  - Mean speedup improved from `0.3508343006383436` to `0.3627422138209748`.
+  - Median speedup improved from `0.3378251885212862` to `0.3505926638979259`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.255697 -> 0.263565`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.281544 -> 0.291005`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.287466 -> 0.291400`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.468715 -> 0.470082`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.388185 -> 0.409785`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.423399 -> 0.450617`.
+- Issues:
+  - Only the D256 causal case has a routed source-path change; the improvements in the other five cases are likely
+    benchmark variance from a favorable run and should not be attributed to the new kernel family.
+  - The code addition is large because the Triton-Ascend frontend previously rejected creating extra block pointers inside
+    a constexpr branch. A separate family avoids perturbing fallback lowering at the cost of duplication.
+  - Keep this family restricted to `BLOCK_N == 2 * BLOCK_M` and `HEAD_DIM == 256`; the broader diagonal split was already
+    measured as negative for long D128 causal.
+- Reports:
+  - `evaluation_reports/codex_point18_d256_diag_split_family_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point18_d256_diag_split_family_performance/evaluation_report.json`

@@ -1133,6 +1133,253 @@ def _attn_fwd(
         )
 
 
+@triton.jit
+def _attn_fwd_causal_diag_split_tile(
+    Q,
+    K,
+    V,
+    M,
+    Out,
+    sm_scale: tl.constexpr,
+    stride_qz: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qm: tl.constexpr,
+    stride_qk: tl.constexpr,
+    stride_kz: tl.constexpr,
+    stride_kh: tl.constexpr,
+    stride_kn: tl.constexpr,
+    stride_kk: tl.constexpr,
+    stride_vz: tl.constexpr,
+    stride_vh: tl.constexpr,
+    stride_vn: tl.constexpr,
+    stride_vk: tl.constexpr,
+    stride_oz: tl.constexpr,
+    stride_oh: tl.constexpr,
+    stride_om: tl.constexpr,
+    stride_on: tl.constexpr,
+    Z: tl.constexpr,
+    H: tl.constexpr,
+    N_CTX: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    linear_tile,
+):
+    tl.static_assert(BLOCK_N == BLOCK_M * 2)
+    num_hz = Z * H
+    task_m_idx = linear_tile // num_hz
+    task_hz_idx = linear_tile - task_m_idx * num_hz
+    off_z = task_hz_idx // H
+    off_h = task_hz_idx - off_z * H
+    qvk_offset = off_z.to(tl.int32) * stride_qz + off_h.to(tl.int32) * stride_qh
+
+    q_block_ptr = tl.make_block_ptr(
+        base=Q + qvk_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_qm, stride_qk),
+        offsets=(task_m_idx * BLOCK_M, 0),
+        block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0),
+    )
+    k_block_ptr = tl.make_block_ptr(
+        base=K + qvk_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_kn, stride_kk),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, HEAD_DIM),
+        order=(1, 0),
+    )
+    v_block_ptr = tl.make_block_ptr(
+        base=V + qvk_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_vn, stride_vk),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, HEAD_DIM),
+        order=(1, 0),
+    )
+    k_diag_block_ptr = tl.make_block_ptr(
+        base=K + qvk_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_kn, stride_kk),
+        offsets=(0, 0),
+        block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0),
+    )
+    v_diag_block_ptr = tl.make_block_ptr(
+        base=V + qvk_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_vn, stride_vk),
+        offsets=(0, 0),
+        block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0),
+    )
+    o_block_ptr = tl.make_block_ptr(
+        base=Out + qvk_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_om, stride_on),
+        offsets=(task_m_idx * BLOCK_M, 0),
+        block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    offs_m = task_m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_n_diag = tl.arange(0, BLOCK_M)
+
+    m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
+    l_i = tl.zeros((BLOCK_M,), tl.float32)
+    acc_ptr = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+
+    tl.static_assert(N_CTX - (N_CTX // BLOCK_M) * BLOCK_M == 0)
+    tl.static_assert(N_CTX - (N_CTX // BLOCK_N) * BLOCK_N == 0)
+    q = tl.load(q_block_ptr)
+    q = (q * sm_scale).to(q.dtype)
+
+    diag_lo = task_m_idx * BLOCK_M
+    full_hi = (diag_lo // BLOCK_N) * BLOCK_N
+    diag_hi = diag_lo + BLOCK_M
+
+    acc_ptr, l_i, m_i = _attn_fwd_inner_loop(
+        acc_ptr,
+        l_i,
+        m_i,
+        q,
+        k_block_ptr,
+        v_block_ptr,
+        0,
+        full_hi,
+        sm_scale,
+        BLOCK_M,
+        HEAD_DIM,
+        BLOCK_N,
+        offs_m,
+        offs_n,
+        False,
+        N_CTX,
+        V.dtype.element_ty == tl.float8e5,
+        True,
+        False,
+    )
+    acc_ptr, l_i, m_i = _attn_fwd_inner_loop(
+        acc_ptr,
+        l_i,
+        m_i,
+        q,
+        k_diag_block_ptr,
+        v_diag_block_ptr,
+        full_hi,
+        diag_lo,
+        sm_scale,
+        BLOCK_M,
+        HEAD_DIM,
+        BLOCK_M,
+        offs_m,
+        offs_n_diag,
+        False,
+        N_CTX,
+        V.dtype.element_ty == tl.float8e5,
+        True,
+        False,
+    )
+    acc_ptr, l_i, m_i = _attn_fwd_inner_loop(
+        acc_ptr,
+        l_i,
+        m_i,
+        q,
+        k_diag_block_ptr,
+        v_diag_block_ptr,
+        diag_lo,
+        diag_hi,
+        sm_scale,
+        BLOCK_M,
+        HEAD_DIM,
+        BLOCK_M,
+        offs_m,
+        offs_n_diag,
+        True,
+        N_CTX,
+        V.dtype.element_ty == tl.float8e5,
+        True,
+        False,
+    )
+
+    m_i += tl.math.log(l_i)
+    accumulator = acc_ptr / l_i[:, None]
+    m_ptrs = M + task_hz_idx * N_CTX + offs_m
+    tl.store(m_ptrs, m_i.to(tl.float32))
+    tl.store(o_block_ptr, accumulator.to(Out.type.element_ty))
+
+
+@triton.jit
+def _attn_fwd_causal_diag_split(
+    Q,
+    K,
+    V,
+    M,
+    Out,
+    sm_scale: tl.constexpr,
+    stride_qz: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qm: tl.constexpr,
+    stride_qk: tl.constexpr,
+    stride_kz: tl.constexpr,
+    stride_kh: tl.constexpr,
+    stride_kn: tl.constexpr,
+    stride_kk: tl.constexpr,
+    stride_vz: tl.constexpr,
+    stride_vh: tl.constexpr,
+    stride_vn: tl.constexpr,
+    stride_vk: tl.constexpr,
+    stride_oz: tl.constexpr,
+    stride_oh: tl.constexpr,
+    stride_om: tl.constexpr,
+    stride_on: tl.constexpr,
+    Z: tl.constexpr,
+    H: tl.constexpr,
+    N_CTX: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    num_tiles_m = tl.cdiv(N_CTX, BLOCK_M)
+    total_tiles = num_tiles_m * Z * H
+    pid = tl.program_id(0)
+    program_count = tl.num_programs(0)
+
+    for linear_tile in tl.range(pid, total_tiles, program_count):
+        _attn_fwd_causal_diag_split_tile(
+            Q,
+            K,
+            V,
+            M,
+            Out,
+            sm_scale,
+            stride_qz,
+            stride_qh,
+            stride_qm,
+            stride_qk,
+            stride_kz,
+            stride_kh,
+            stride_kn,
+            stride_kk,
+            stride_vz,
+            stride_vh,
+            stride_vn,
+            stride_vk,
+            stride_oz,
+            stride_oh,
+            stride_om,
+            stride_on,
+            Z,
+            H,
+            N_CTX,
+            HEAD_DIM,
+            BLOCK_M,
+            BLOCK_N,
+            linear_tile,
+        )
+
+
 def _validate_inputs(q, k, v):
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise ValueError("q, k, v must all be 4D tensors shaped [Z, H, N_CTX, HEAD_DIM]")
@@ -1173,6 +1420,40 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None):
     # Keep the fp32 accumulator in UB whenever it fits. The wide-lazy family is
     # intentionally excluded because lazy BN=256 overflows L0C when acc stays resident.
     acc_in_ub = False if wide_lazy_gm else _acc_in_ub(bm, head_dim, bn)
+    if causal and head_dim == 256 and bm == 64 and bn == 128 and (not use_max) and acc_in_ub:
+        _attn_fwd_causal_diag_split[grid](
+            q,
+            k,
+            v,
+            lse,
+            out,
+            sm_scale,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            z,
+            h,
+            N_CTX=n_ctx,
+            HEAD_DIM=head_dim,
+            BLOCK_M=bm,
+            BLOCK_N=bn,
+            debug=False,
+        )
+        return out, lse
+
     acc = (
         torch.empty((1,), dtype=torch.float32, device=q.device)
         if acc_in_ub
