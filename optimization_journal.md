@@ -401,3 +401,38 @@
   - Final source after this entry remains identical to the point 11 implementation.
 - Reports:
   - Targeted inline probe only; no evaluator report was generated because source was not changed.
+
+## 2026-07-25 - Optimization point 7: D256 causal accumulator UB residency
+
+- Commit: code commit for this entry.
+- Optimization point: 7, pass elimination / repeated GM accumulator traffic elimination.
+- Content:
+  - Added a narrow `_acc_in_ub()` exception for the measured compile-safe tile
+    `(HEAD_DIM=256, BLOCK_M=64, BLOCK_N=128)`.
+  - This tile is used by the performance case `(128, 8, 1024, 256, causal=True)`.
+  - Keeping the accumulator resident for this tile removes the per-KV-block fp32 accumulator GM load/store path in
+    `_attn_fwd_inner_loop()` and uses the fused `tl.dot(p_cast, v, acc_ptr)` accumulate path instead.
+  - Did not relax the global UB budget. A probe showed that forcing UB residency for the non-causal D256 tile
+    `(BM=128, BN=128)` fails MLIR lowering with CC overflow (`1572864 > 1048576` bits).
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point7_d256_acc_ub_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point7_d256_acc_ub_performance/evaluation_report.json`.
+  - Performance score changed from point 11 `20.1515 / 60` to `20.1904 / 60`.
+  - Mean speedup changed from `0.33585816600990115` to `0.33650674508638215`.
+  - Targeted D256 causal case improved:
+    - `(128, 8, 1024, 256, causal=True)`: speedup `0.271174 -> 0.285737`
+    - Candidate median latency `18166.575 us -> 17286.640 us`
+  - Other cases did not match the new `_acc_in_ub()` exception and moved only within benchmark noise.
+- Issues:
+  - The aggregate score gain is small because only one of six performance cases uses the new resident-accumulator path.
+  - The exception must remain narrow. Enabling UB accumulator broadly for D256 can compile-fail non-causal D256 due to
+    L0C/CC overflow.
+  - This does not solve the larger gap to `torch_npu.npu_fusion_attention`; it only removes a confirmed avoidable GM
+    accumulator round-trip on one safe tile.
+- Reports:
+  - `evaluation_reports/codex_point7_d256_acc_ub_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point7_d256_acc_ub_performance/evaluation_report.json`

@@ -198,6 +198,10 @@ def _ub_footprint_bytes(block_m, block_n, head_dim):
 def _acc_in_ub(block_m, head_dim, block_n=None):
     if head_dim < 256:
         return True
+    # Measured compile-safe D256 exception: (BM=64, BN=128) can keep the
+    # accumulator resident and avoids per-KV-block GM load/store traffic.
+    if head_dim == 256 and block_m == 64 and block_n == 128:
+        return True
     if block_n is None:
         return False
     return _ub_footprint_bytes(block_m, block_n, head_dim) <= _ub_budget()
