@@ -729,3 +729,56 @@
 - Reports:
   - `evaluation_reports/codex_point18_causal_lazy_ub_family_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point18_causal_lazy_ub_family_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 7: wide-BN lazy softmax with GM accumulator
+
+- Commit: source + journal commit for this entry.
+- Optimization point: 7, pass elimination / stable-softmax statistics elimination.
+- Content:
+  - Used the existing profiler/simulator evidence to specialize the sync-bound wide-BN family instead of copying the
+    generic kernel:
+    - torch_npu profiler for `(128, 8, 8192, 64, causal=False)` showed `_attn_fwd` duration `606970.124 us`,
+      `cube_utilization(%)=97.853`, but very low `aic_mac_ratio=0.113`.
+    - simulator aggregation showed `MMAD` was only `0.8%` of instruction running time, while
+      `WAIT_FLAG + BAR + WAIT_FLAG_DEVI + SET_FLAG` was about `71.1%`.
+    - Pipe aggregation was dominated by `VECTOR` (`33.8%`), `FLOWCTRL` (`18.7%`), `SCALAR` (`12.2%`),
+      `MTE2` (`12.2%`), and `MTE3` (`8.0%`), not raw Cube MAC work.
+  - Added `_use_wide_lazy_gm(block_m, block_n, head_dim, causal, n_ctx)` for
+    `BLOCK_N == 256 and HEAD_DIM <= 128 and N_CTX >= 1024`.
+  - For that family only, set `use_max=False` and force `ACC_IN_UB=False`, trading GM accumulator traffic for removing
+    stable-softmax `max/alpha/acc-rescale` vector work.
+  - Kept `FA_USE_MAX` override semantics unchanged; explicit `FA_USE_MAX=1/0` bypasses this automatic family rule.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point7_wide_lazy_gm_correctness/evaluation_report.json`.
+  - Submit-sensitive spot checks via `evaluate_attention.run_correctness_case()`:
+    - `torch.bfloat16`, `(128, 8, 1024, 64, causal=False)`: passed, `max_abs_diff=0.001953125`.
+    - `torch.float16`, `(1, 2, 1024, 64, causal=False)`: passed, `max_abs_diff=0.0001220703125`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point7_wide_lazy_gm_performance/evaluation_report.json`.
+  - Performance score improved from the active divisible-boundary implementation `20.5003 / 60` to `21.0465 / 60`.
+  - Mean speedup improved from `0.3416714652487010` to `0.3507746595843307`.
+  - Median speedup improved from `0.3242350016847925` to `0.3381159877112202`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.256759 -> 0.249607`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.290876 -> 0.286369`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.278085 -> 0.286779`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.487924 -> 0.466992`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.357594 -> 0.389453`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.378791 -> 0.425448`.
+- Issues:
+  - The tradeoff helps the long sync-bound non-causal shapes substantially but regresses the already-lazy short causal
+    shapes in this run due measurement variance or secondary scheduling effects. The aggregate score is positive, so the
+    source change is kept.
+  - The non-causal D256 case `(128, 8, 2048, 256, causal=False)` regressed because it is already `BN=128` lazy with a
+    GM accumulator and does not benefit from the new wide-BN rule; this appears to be run-to-run variance, not a routed
+    code-path change.
+  - This confirms the useful specialization axis is not "copy the whole kernel and delete branches"; it is selecting a
+    different accumulator residency policy for the profile-identified stable wide-BN family.
+- Reports:
+  - `result_dir/profile_summary.json`
+  - `profiling_runs/sim_point6_baseline/OPPROF_20260725023458_FUPEWIPFAYQPOEYP/simulator/`
+  - `evaluation_reports/codex_point7_wide_lazy_gm_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point7_wide_lazy_gm_performance/evaluation_report.json`

@@ -222,6 +222,17 @@ def _use_lazy(block_m, block_n, head_dim, causal):
     return block_n <= 128
 
 
+def _use_wide_lazy_gm(block_m, block_n, head_dim, causal, n_ctx):
+    """Use lazy softmax on wide-BN score tiles by spilling the accumulator to GM.
+
+    The profiler/simulator for the long non-causal wide-BN path is dominated by
+    Vector/FlowCtrl wait and barrier instructions rather than MMAD. Keeping the
+    accumulator in UB makes BN=256 lazy fail lowering, so this shape family trades
+    GM accumulator traffic for removing stable-softmax max/alpha/rescale work.
+    """
+    return block_n == 256 and head_dim <= 128 and n_ctx >= 1024
+
+
 def _default_tiling(z, h, n_ctx, head_dim, causal):
     preset = DEFAULT_TILING_PRESETS.get((z, h, n_ctx, head_dim, causal))
     if preset is not None:
@@ -1145,15 +1156,6 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None):
     bm, bn, _ = _resolve_tiling(z, h, n_ctx, head_dim, causal, bm, bn)
     out = torch.empty_like(q)
     lse = torch.empty((z, h, n_ctx), device=q.device, dtype=torch.float32)
-    # Keep the fp32 accumulator in UB whenever (BLOCK_M x HEAD_DIM) fits, even for
-    # HEAD_DIM==256. This avoids the per-KV-iteration GM round-trip + extract_slice
-    # path, which is pure Vector/MTE overhead on the critical path.
-    acc_in_ub = _acc_in_ub(bm, head_dim, bn)
-    acc = (
-        torch.empty((1,), dtype=torch.float32, device=q.device)
-        if acc_in_ub
-        else torch.zeros((z, h, n_ctx, head_dim), dtype=torch.float32, device=q.device)
-    )
     stage = 3 if causal else 1
     grid = _build_grid(z, h, n_ctx, bm)
 
@@ -1162,10 +1164,20 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None):
     # on the stable path when the tile is too wide to also hold the lazy accumulator in
     # L0C. Tuned per case via _use_lazy(); FA_USE_MAX=1/0 force stable/lazy.
     forced = os.environ.get("FA_USE_MAX")
+    wide_lazy_gm = forced is None and _use_wide_lazy_gm(bm, bn, head_dim, causal, n_ctx)
     if forced is not None:
         use_max = forced == "1"
     else:
-        use_max = not _use_lazy(bm, bn, head_dim, causal)
+        use_max = not (_use_lazy(bm, bn, head_dim, causal) or wide_lazy_gm)
+
+    # Keep the fp32 accumulator in UB whenever it fits. The wide-lazy family is
+    # intentionally excluded because lazy BN=256 overflows L0C when acc stays resident.
+    acc_in_ub = False if wide_lazy_gm else _acc_in_ub(bm, head_dim, bn)
+    acc = (
+        torch.empty((1,), dtype=torch.float32, device=q.device)
+        if acc_in_ub
+        else torch.zeros((z, h, n_ctx, head_dim), dtype=torch.float32, device=q.device)
+    )
 
     _attn_fwd[grid](
         q,
