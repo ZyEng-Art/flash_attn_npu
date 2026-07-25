@@ -895,6 +895,43 @@
 - Reports:
   - Targeted same-process inline probe only; no evaluator report was generated because source was not changed.
 
+## 2026-07-25 - Optimization point 9: exp2 softmax math replacement regression
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 9, libdevice / math function selection.
+- Content:
+  - Replaced the softmax exponentials with the mathematically equivalent `exp2(x * log2(e))` form:
+    - stable path: `exp(qk)` and `exp(m_i - m_ij)`;
+    - lazy path: `exp(qk)` and `exp(qk - 6.0)` for `HEAD_DIM >= 256`.
+  - The intent was to reduce Vector math latency in the softmax chain without changing tiling, routing, or accumulator
+    residency.
+  - Reverted the source after validation because the aggregate performance regressed.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite for the experimental code: `18/18` passed in
+    `evaluation_reports/codex_point9_exp2_correctness/evaluation_report.json`.
+  - Performance suite for the experimental code: `6/6` matched in
+    `evaluation_reports/codex_point9_exp2_performance/evaluation_report.json`.
+  - Performance score regressed from the active D256 diagonal-split implementation `21.7645 / 60` to `21.0302 / 60`.
+  - Mean speedup regressed from `0.3627422138209748` to `0.3505034236571608`.
+  - Median speedup regressed from `0.3505926638979259` to `0.3373585130661327`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.263565 -> 0.257921`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.291005 -> 0.279407`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.291400 -> 0.287369`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.470082 -> 0.472839`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.409785 -> 0.387348`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.450617 -> 0.418137`.
+- Issues:
+  - `exp2` helps the non-causal D256 GM-accumulator case slightly, but it slows the five other scored shapes and loses
+    significantly on the long wide-lazy-GM family.
+  - On this Triton-Ascend stack, `tl.math.exp` is already the better lowering for the dominant lazy softmax path.
+  - Keep the current `tl.math.exp` calls unless future IR evidence shows a different libdevice lowering.
+- Reports:
+  - `evaluation_reports/codex_point9_exp2_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point9_exp2_performance/evaluation_report.json`
+
 ## 2026-07-25 - Optimization point 2: causal D128 narrow-BN tiling recheck
 
 - Commit: journal-only commit for this entry.
