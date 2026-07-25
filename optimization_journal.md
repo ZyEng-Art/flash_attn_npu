@@ -600,3 +600,43 @@
 - Reports:
   - `evaluation_reports/codex_point6_tile_index_i32_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point6_tile_index_i32_performance/evaluation_report.json`
+
+## 2026-07-25 - Optimization point 7: causal diagonal split regression
+
+- Commit: journal-only commit for this entry.
+- Optimization point: 7, pass elimination / masked future-column compute elimination.
+- Content:
+  - Probed a causal `BM < BN` diagonal-stage split to avoid computing future columns that are immediately masked out.
+  - The first implementation created BM-sized K/V block pointers inside a constexpr branch and failed Triton frontend
+    lowering for every correctness case with `UnsupportedLanguageConstruct`.
+  - The second implementation created the BM-sized block pointers unconditionally and used them only in the causal
+    diagonal branch. It passed correctness but regressed performance, so the source was reverted.
+- Effect:
+  - v1 correctness report: `0/18` due frontend compile failure in
+    `evaluation_reports/codex_point7_diag_split_correctness/evaluation_report.json`.
+  - v2 `python3 -m py_compile flash_attention_forward.py`: pass.
+  - v2 `git diff --check`: pass.
+  - v2 correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point7_diag_split_v2_correctness/evaluation_report.json`.
+  - v2 performance suite: `6/6` matched in
+    `evaluation_reports/codex_point7_diag_split_v2_performance/evaluation_report.json`.
+  - Performance score regressed from the active divisible-boundary implementation `20.5003 / 60` to `19.7107 / 60`.
+  - Mean speedup regressed from `0.3416714652487010` to `0.3285118825849434`.
+  - Per-shape speedups:
+    - `(128, 8, 1024, 128, causal=True)`: `0.256759 -> 0.252655`.
+    - `(128, 8, 1024, 256, causal=True)`: `0.290876 -> 0.294072`.
+    - `(128, 8, 2048, 128, causal=True)`: `0.278085 -> 0.219105`.
+    - `(128, 8, 2048, 256, causal=False)`: `0.487924 -> 0.471837`.
+    - `(128, 8, 4096, 128, causal=False)`: `0.357594 -> 0.355269`.
+    - `(128, 8, 8192, 64, causal=False)`: `0.378791 -> 0.378133`.
+- Issues:
+  - The D256 short causal case gained slightly, but the long D128 causal case lost heavily. The extra BM-sized dot calls
+    and additional block pointers cost more than the masked-column work they remove.
+  - Creating block pointers inside constexpr branches is not accepted by this Triton-Ascend frontend.
+  - Do not split the diagonal pass this way unless a future version can keep wide-dot efficiency while avoiding the
+    future-column mask work.
+  - Final source after this entry remains the positive divisible-boundary implementation.
+- Reports:
+  - `evaluation_reports/codex_point7_diag_split_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point7_diag_split_v2_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point7_diag_split_v2_performance/evaluation_report.json`
