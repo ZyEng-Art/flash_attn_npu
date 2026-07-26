@@ -2435,3 +2435,64 @@
 - Reports:
   - `evaluation_reports/codex_point18_d256_noncausal_loop_family_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point18_d256_noncausal_loop_family_performance/evaluation_report.json`
+
+## 2026-07-26 - Optimization point 18: no-LSE-store kernel family specialization
+
+- Commit: source + journal commit for this positive optimization.
+- Optimization point: 18, kernel splitting / kernel family specialization, applied to the default evaluator path where
+  `attention(..., return_lse=False)` returns only the attention output.
+- Motivation:
+  - The public/evaluator call path only consumes `attention()`'s `out`; it never requests the auxiliary LSE/M tensor.
+  - The existing kernels still allocated a full `(Z, H, N_CTX)` fp32 `lse` tensor and wrote `M` for every tile. On the
+    long performance shapes this is extra GM allocation/MTE3 work that does not contribute to the score.
+  - Strict optimization point 21 was reviewed but not used as the formal hit because this forward kernel does not have
+    the multi-pass loop-order conflict required by `workspace-decoupling.md`. The correct framing is point 18: specialize
+    the default no-LSE kernel family while preserving the original LSE-producing path.
+- Content:
+  - Added `STORE_LSE: tl.constexpr` to `_attn_fwd_tile`, `_attn_fwd`, `_attn_fwd_causal_hz_major`,
+    `_attn_fwd_causal_diag_split(_tile)`, and `_attn_fwd_causal_diag_split_parity(_tile)`.
+  - Wrapped the `M + task_hz_idx * N_CTX + offs_m` store in `if STORE_LSE:` for all generic, hz-major, diag-split, and
+    parity diag-split families.
+  - Changed `_launch_kernel(..., return_lse=False)` to allocate a one-element dummy fp32 LSE tensor and launch kernels
+    with `STORE_LSE=False`.
+  - Kept `attention(..., return_lse=True)` behavior intact: it allocates the full `(Z,H,N_CTX)` LSE tensor, launches the
+    same kernels with `STORE_LSE=True`, and returns `(out, lse)`.
+  - Did not change tiling presets, math, lazy/stable softmax selection, D128 hz-major compile parameters, D256 parity
+    split routing, generic fallback routing, or `DEFAULT_PERSISTENT_PROGRAMS = 20`.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - `return_lse=True` smoke test on `(1,1,64,64, causal=False)` returned `out.shape=(1,1,64,64)` and
+    `lse.shape=(1,1,64)`.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point18_no_lse_store_correctness/evaluation_report.json`.
+  - Performance run 1: `6/6` matched in
+    `evaluation_reports/codex_point18_no_lse_store_performance/evaluation_report.json`.
+    - Submit-style performance score was effectively tied but slightly below the previous best:
+      `22.43218328741033 / 60` vs `22.43424911157306 / 60`.
+    - Mean speedup `0.3738697214568388`; median speedup `0.36733335915679155`.
+  - Performance run 2: `6/6` matched in
+    `evaluation_reports/codex_point18_no_lse_store_performance_r2/evaluation_report.json`.
+    - Submit-style performance score improved to `22.472169993216955 / 60`, above the previous best
+      `22.43424911157306 / 60`.
+    - Expected full score with correctness is `62.472169993216955 / 100`.
+    - Mean speedup improved from `0.373904151859551` to `0.3745361665536159`.
+    - Median speedup improved from `0.3661752970191059` to `0.36766529750681753`.
+    - Per-shape speedup deltas versus the previous best run:
+      - `(128,8,1024,128, causal=True)`: `0.2862688260353736 -> 0.2877251021086774`.
+      - `(128,8,1024,256, causal=True)`: `0.29087665397851187 -> 0.28963282926082656`.
+      - `(128,8,2048,128, causal=True)`: `0.3265679147525726 -> 0.32677337225783415`.
+      - `(128,8,2048,256, causal=False)`: `0.48396344081902276 -> 0.48349845470275304`.
+      - `(128,8,4096,128, causal=False)`: `0.40578267928563927 -> 0.40855722275580086`.
+      - `(128,8,8192,64, causal=False)`: `0.449965396286186 -> 0.45103001823580335`.
+- Issues:
+  - The first full performance run was a near-tie/slight loss, so the effect is small and noisy rather than a large
+    structural win.
+  - The second full run crossed the active best by `0.037920881643895 / 60`, and the shapes most expected to benefit
+    from less output materialization (D128 long non-causal and D64 long non-causal) improved in that run.
+  - D256 causal and D256 non-causal were slightly lower by speedup ratio in run 2, though their candidate latencies were
+    effectively unchanged. Keep this optimization because the full evaluator score improved and correctness was stable.
+- Reports:
+  - `evaluation_reports/codex_point18_no_lse_store_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point18_no_lse_store_performance/evaluation_report.json`
+  - `evaluation_reports/codex_point18_no_lse_store_performance_r2/evaluation_report.json`
