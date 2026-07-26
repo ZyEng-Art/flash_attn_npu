@@ -2336,3 +2336,55 @@
 - Reports:
   - `evaluation_reports/codex_point18_d128_phase1024_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point18_d128_phase1024_performance/evaluation_report.json`
+
+## 2026-07-26 - Optimization point 18: D128 causal 1024 single-launch local-diagonal regression
+
+- Commit: journal-only commit for this entry; source was reverted because the aggregate evaluator score did not improve.
+- Optimization point: 18, kernel splitting / kernel family specialization, tested narrowly on the D128 causal
+  `N_CTX=1024` hz-major path.
+- Motivation:
+  - The previous D128 modulo-4 phase split confirmed that four sequential launches are too expensive for this shape.
+  - The profile/IR evidence still points at scalar/index/sync pressure in the D128 hz-major path:
+    `sync_block_set=24`, `sync_block_wait=24`, `wait_flag=50`, `set_flag=50`, `pipe_barrier=19`,
+    `arith.index_cast=40`, `arith.muli=26`, and `arith.divsi=12`.
+  - Hypothesis: keeping a single launch while locally specializing the diagonal block could reduce dynamic mask/index
+    work without paying the multi-launch penalty.
+- Content:
+  - Temporarily added `_attn_fwd_causal_hz_local_diag_tile` and `_attn_fwd_causal_hz_local_diag`.
+  - The local-diagonal tile kept the existing hz-major linear tile mapping, derived `task_phase` with
+    `task_m_idx - task_group_idx * 4` to avoid `%`, processed pre-diagonal blocks through `_attn_fwd_inner_loop`, and
+    handled the diagonal `BN=256` block with a local mask based on `task_phase * BLOCK_M + arange(BLOCK_M)`.
+  - Temporarily routed only `use_causal_hz_major_family and n_ctx == 1024` to this single-launch local-diagonal family.
+  - Left the D128 `N_CTX=2048` full CV-parameter branch, D256 parity split, generic fallback, tiling presets, and
+    `DEFAULT_PERSISTENT_PROGRAMS = 20` unchanged.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point18_d128_local_diag1024_correctness/evaluation_report.json`.
+  - Performance run 1: `6/6` matched in
+    `evaluation_reports/codex_point18_d128_local_diag1024_performance/evaluation_report.json`.
+    - Submit-style performance score regressed from the active best `22.43424911157306 / 60` to
+      `22.363591885440123 / 60`.
+    - Mean speedup regressed from `0.373904151859551` to `0.372726531424002`.
+    - Median speedup moved from `0.3661752970191059` to `0.36812911343522947`.
+    - Targeted D128 causal 1024 speedup improved from `0.2862688260353736` to `0.2884358517810714`;
+      candidate median latency improved from `10483.604856 us` to `10348.939802 us`.
+  - Performance run 2: `6/6` matched in
+    `evaluation_reports/codex_point18_d128_local_diag1024_performance_r2/evaluation_report.json`.
+    - Submit-style performance score remained below best at `22.396753930040745 / 60`.
+    - Mean speedup remained below best at `0.37327923216734576`.
+    - Median speedup was `0.36877514209269135`.
+    - Targeted D128 causal 1024 speedup again improved from `0.2862688260353736` to `0.28848541992612425`;
+      candidate median latency improved from `10483.604856 us` to `10334.769730 us`.
+- Issues:
+  - The source change improved only the intended target shape by about 1.4% latency, but both full performance runs
+    stayed below the active best aggregate evaluator score.
+  - The aggregate regression was dominated by unrelated non-causal long-shape noise/regression in the same runs, but the
+    evaluator score is the acceptance criterion, so this code was not adopted.
+  - Single-launch local diagonal handling is much better than the four-launch phase split, but the gain is too small to
+    carry the full score. Future D128 work should look for larger structural changes, not further phase splitting.
+- Reports:
+  - `evaluation_reports/codex_point18_d128_local_diag1024_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point18_d128_local_diag1024_performance/evaluation_report.json`
+  - `evaluation_reports/codex_point18_d128_local_diag1024_performance_r2/evaluation_report.json`
