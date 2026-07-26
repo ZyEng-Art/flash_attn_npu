@@ -2687,3 +2687,47 @@
 - Reports:
   - `evaluation_reports/codex_point25_d128_1024_full_cv_current_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point25_d128_1024_full_cv_current_performance/evaluation_report.json`
+
+## 2026-07-26 - Optimization point 7: no-LSE lazy m_i zero-init regression
+
+- Commit: journal-only commit for this entry; source was reverted after performance validation.
+- Optimization point: 7, pass elimination / unused lazy LSE state cleanup.
+- Motivation:
+  - On the default evaluator path `STORE_LSE=False`, all scored performance shapes use lazy softmax (`USE_MAX=False`).
+  - In those paths `m_i` is not needed for output normalization after the no-LSE log elision, but the source still
+    initialized it with `tl.full(..., -inf)` and threaded it through the inner loop.
+  - Hypothesis: using `tl.zeros` for no-LSE lazy `m_i` while preserving `-inf` for `USE_MAX=True` and `STORE_LSE=True`
+    could make the dead state easier for the compiler to eliminate or cheaper to materialize.
+- Content:
+  - Temporarily changed `_attn_fwd_tile()` so `m_i` is initialized to `-inf` only for stable softmax or LSE-producing
+    lazy paths, and to zeros for no-LSE lazy paths.
+  - Applied the same `STORE_LSE`-guarded `m_i` initialization to `_attn_fwd_causal_diag_split_tile()` and
+    `_attn_fwd_causal_diag_split_parity_tile()`.
+  - Did not change tiling, math for `Out`, D128 hz-major routing, D256 parity routing, compile parameters, or
+    `DEFAULT_PERSISTENT_PROGRAMS = 20`.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point7_no_lse_lazy_m_zero_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point7_no_lse_lazy_m_zero_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.506673665520136 / 60` to
+    `22.449079618732235 / 60`.
+  - Mean speedup regressed from `0.37511122775866895` to `0.37415132697887055`.
+  - Per-shape speedups after the experiment:
+    - `(128,8,1024,128, causal=True)`: `0.28712973120467805`.
+    - `(128,8,1024,256, causal=True)`: `0.2900894022551739`.
+    - `(128,8,2048,128, causal=True)`: `0.32554674591415`.
+    - `(128,8,2048,256, causal=False)`: `0.4896549561233495`.
+    - `(128,8,4096,128, causal=False)`: `0.40551408506909065`.
+    - `(128,8,8192,64, causal=False)`: `0.4469730413067812`.
+- Issues:
+  - Even though `m_i` is logically dead on the no-LSE lazy path, the zero-init branch did not improve the aggregate
+    evaluator score. It likely changed lowering/scheduling more than it reduced actual vector work.
+  - Keep the original unconditional `-inf` source shape unless fresh IR proves the dead `m_i` broadcast is still on the
+    critical path and can be removed without introducing an extra scheduling branch.
+  - The temporary source change was reverted.
+- Reports:
+  - `evaluation_reports/codex_point7_no_lse_lazy_m_zero_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point7_no_lse_lazy_m_zero_performance/evaluation_report.json`
