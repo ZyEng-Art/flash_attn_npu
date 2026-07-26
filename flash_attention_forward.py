@@ -1051,7 +1051,6 @@ def _attn_fwd_tile(
             ELIDE_UNUSED_MASK_INDEX,
         )
 
-    m_i += tl.math.log(l_i)
     if ACC_IN_UB:
         accumulator = acc_ptr / l_i[:, None]
     else:
@@ -1061,6 +1060,7 @@ def _attn_fwd_tile(
         accumulator = accumulator / l_i[:, None]
 
     if STORE_LSE:
+        m_i += tl.math.log(l_i)
         m_ptrs = M + task_hz_idx * N_CTX + offs_m
         tl.store(m_ptrs, m_i.to(tl.float32))
     tl.store(o_block_ptr, accumulator.to(Out.type.element_ty))
@@ -1407,9 +1407,9 @@ def _attn_fwd_causal_diag_split_tile(
         False,
     )
 
-    m_i += tl.math.log(l_i)
     accumulator = acc_ptr / l_i[:, None]
     if STORE_LSE:
+        m_i += tl.math.log(l_i)
         m_ptrs = M + task_hz_idx * N_CTX + offs_m
         tl.store(m_ptrs, m_i.to(tl.float32))
     tl.store(o_block_ptr, accumulator.to(Out.type.element_ty))
@@ -1667,9 +1667,9 @@ def _attn_fwd_causal_diag_split_parity_tile(
         False,
     )
 
-    m_i += tl.math.log(l_i)
     accumulator = acc_ptr / l_i[:, None]
     if STORE_LSE:
+        m_i += tl.math.log(l_i)
         m_ptrs = M + task_hz_idx * N_CTX + offs_m
         tl.store(m_ptrs, m_i.to(tl.float32))
     tl.store(o_block_ptr, accumulator.to(Out.type.element_ty))

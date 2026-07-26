@@ -2540,3 +2540,61 @@
 - Reports:
   - `evaluation_reports/codex_point18_no_lse_alias_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point18_no_lse_alias_performance/evaluation_report.json`
+
+## 2026-07-26 - Optimization point 18: no-LSE log elision specialization
+
+- Commit: source + journal commit for this positive optimization.
+- Optimization point: 18, kernel splitting / kernel family specialization, applied as a second no-LSE default-path
+  specialization after `STORE_LSE=False`.
+- Motivation:
+  - The positive no-LSE-store family stopped writing the auxiliary `M/LSE` output on the evaluator path, but the tile
+    epilogue still computed `m_i += tl.math.log(l_i)` before the guarded store.
+  - `m_i + log(l_i)` is only needed when materializing LSE. The default `attention(..., return_lse=False)` path only
+    needs `l_i` for output normalization, so the vector log/add is dead work there.
+  - Hypothesis: moving the log/add into the `STORE_LSE` branch should reduce vector epilogue work without changing
+    attention output or the `return_lse=True` path.
+- Content:
+  - Moved `m_i += tl.math.log(l_i)` under `if STORE_LSE:` in `_attn_fwd_tile`,
+    `_attn_fwd_causal_diag_split_tile`, and `_attn_fwd_causal_diag_split_parity_tile`.
+  - Kept output normalization unchanged: `accumulator = acc / l_i[:, None]`.
+  - Kept the one-element fp32 dummy LSE tensor for the no-LSE path, because replacing it with `out` was measured as a
+    broad regression.
+  - Did not change tiling presets, math for `Out`, lazy/stable softmax selection, D128 hz-major compile parameters,
+    D256 parity routing, generic fallback routing, or `DEFAULT_PERSISTENT_PROGRAMS = 20`.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - `return_lse=True` smoke test on `(1,1,64,64, causal=False)` returned `out.shape=(1,1,64,64)` and
+    `lse.shape=(1,1,64)`.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point18_no_lse_log_elide_correctness/evaluation_report.json`.
+  - Performance run 1: `6/6` matched in
+    `evaluation_reports/codex_point18_no_lse_log_elide_performance/evaluation_report.json`.
+    - Submit-style performance score improved from `22.472169993216955 / 60` to
+      `22.493326412621617 / 60`.
+    - Mean speedup improved from `0.3745361665536159` to `0.3748887735436936`.
+    - Median speedup improved from `0.36766529750681753` to `0.36795586855652795`.
+  - Performance run 2: `6/6` matched in
+    `evaluation_reports/codex_point18_no_lse_log_elide_performance_r2/evaluation_report.json`.
+    - Submit-style performance score improved further to `22.506673665520136 / 60`.
+    - Expected full score with correctness is `62.506673665520136 / 100`.
+    - Mean speedup improved to `0.37511122775866895`.
+    - Median speedup was `0.367469250279431`.
+    - Per-shape speedup deltas versus the previous best run:
+      - `(128,8,1024,128, causal=True)`: `0.2877251021086774 -> 0.2860793263628685`.
+      - `(128,8,1024,256, causal=True)`: `0.28963282926082656 -> 0.2908101646927782`.
+      - `(128,8,2048,128, causal=True)`: `0.32677337225783415 -> 0.3271592699844636`.
+      - `(128,8,2048,256, causal=False)`: `0.48349845470275304 -> 0.4879122341826647`.
+      - `(128,8,4096,128, causal=False)`: `0.40855722275580086 -> 0.40777923057439847`.
+      - `(128,8,8192,64, causal=False)`: `0.45103001823580335 -> 0.4509271407548402`.
+- Issues:
+  - The gain is still small and performance remains noisy; causal D128 1024 and long non-causal D128/D64 did not improve
+    by speedup ratio in run 2.
+  - The repeated positive full-score result indicates the log/add was not fully removed by the compiler after the store
+    guard, so keeping it inside `STORE_LSE` is beneficial for the default evaluator path.
+  - `return_lse=True` continues to compile and return the expected shapes, but the lazy path's LSE numerical semantics
+    are unchanged from the pre-existing implementation and are not used by the evaluator.
+- Reports:
+  - `evaluation_reports/codex_point18_no_lse_log_elide_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point18_no_lse_log_elide_performance/evaluation_report.json`
+  - `evaluation_reports/codex_point18_no_lse_log_elide_performance_r2/evaluation_report.json`
