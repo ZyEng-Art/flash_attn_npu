@@ -2496,3 +2496,47 @@
   - `evaluation_reports/codex_point18_no_lse_store_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point18_no_lse_store_performance/evaluation_report.json`
   - `evaluation_reports/codex_point18_no_lse_store_performance_r2/evaluation_report.json`
+
+## 2026-07-26 - Optimization point 18: no-LSE dummy allocation elision regression
+
+- Commit: journal-only commit for this entry; source was reverted after a broad performance regression.
+- Optimization point: 18, kernel splitting / kernel family specialization, tested as a narrow follow-up to the positive
+  no-LSE-store family.
+- Motivation:
+  - After adding `STORE_LSE=False`, the default evaluator path still allocated a one-element fp32 dummy LSE tensor so the
+    kernel signature kept a valid unused `M` pointer.
+  - Hypothesis: since `STORE_LSE=False` makes the `M` pointer dead in Triton IR, passing `out` as the unused `M` argument
+    could remove even that tiny host/device allocation without changing the generated compute path.
+- Content:
+  - Temporarily changed `_launch_kernel(..., return_lse=False)` from allocating a one-element fp32 dummy LSE tensor to
+    reusing `out` as the unused `M` argument.
+  - Kept `STORE_LSE=False` and all `tl.store(M)` guards unchanged.
+  - Did not change math, tiling, persistent programs, compile parameters, D128 hz-major routing, D256 parity routing, or
+    `return_lse=True` behavior.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point18_no_lse_alias_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point18_no_lse_alias_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.472169993216955 / 60` to
+    `21.551451554576147 / 60`.
+  - Mean speedup regressed from `0.3745361665536159` to `0.3591908592429358`.
+  - Median speedup regressed from `0.36766529750681753` to `0.3521602856972894`.
+  - Every performance shape regressed:
+    - `(128,8,1024,128, causal=True)`: `0.2877251021086774 -> 0.2762523369723267`.
+    - `(128,8,1024,256, causal=True)`: `0.28963282926082656 -> 0.2813657482457977`.
+    - `(128,8,2048,128, causal=True)`: `0.32677337225783415 -> 0.3134614430244421`.
+    - `(128,8,2048,256, causal=False)`: `0.48349845470275304 -> 0.46824157177657566`.
+    - `(128,8,4096,128, causal=False)`: `0.40855722275580086 -> 0.3908591283701367`.
+    - `(128,8,8192,64, causal=False)`: `0.45103001823580335 -> 0.42496492706833583`.
+- Issues:
+  - Although `M` is dead under `STORE_LSE=False`, changing the runtime argument from a fp32 dummy tensor to the fp16
+    output tensor appears to create a different kernel specialization/lowering and slows all shapes.
+  - The one-element fp32 dummy allocation is therefore kept. Do not replace the unused `M` argument with `out` unless new
+    IR evidence shows the pointer dtype no longer affects lowering.
+  - The source change was reverted, restoring the positive no-LSE-store implementation from commit `4069490`.
+- Reports:
+  - `evaluation_reports/codex_point18_no_lse_alias_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point18_no_lse_alias_performance/evaluation_report.json`
