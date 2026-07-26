@@ -2731,3 +2731,55 @@
 - Reports:
   - `evaluation_reports/codex_point7_no_lse_lazy_m_zero_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point7_no_lse_lazy_m_zero_performance/evaluation_report.json`
+
+## 2026-07-26 - Optimization point 18: D128 causal 1024 lazy-UB explicit-add regression
+
+- Commit: journal-only commit for this entry; source was reverted after validation.
+- Optimization point: 18, kernel-family / shape-policy specialization, tested narrowly on the D128 causal
+  `N_CTX=1024` lazy UB path.
+- Motivation:
+  - The current D128 causal 1024 profile remains scalar/sync/MTE-heavy rather than a clean MMAD limit, and this shape
+    still uses the lazy `ACC_IN_UB=True` path with fused `tl.dot(p_cast, v, acc_ptr)` accumulation.
+  - Hypothesis: for the short D128 causal family, forcing the explicit-add form
+    `acc_ptr = acc_ptr + tl.dot(p_cast, v)` might reduce fused-accumulate scheduling pressure even though the qk+acc
+    footprint fits L0C.
+- Content:
+  - Temporarily routed only `HEAD_DIM=128`, `BLOCK_M=64`, `BLOCK_N=256`, `N_CTX=1024` in the lazy UB branch to the
+    explicit-add accumulate form.
+  - Left tiling, D128 hz-major routing, D128 2048 compile parameters, D256 parity routing, no-LSE log/store elision,
+    persistent program count, and math outside the accumulator update unchanged.
+  - The first two source forms used chained boolean conditions and passed Python syntax checks, but failed Triton lowering
+    with `UnsupportedLanguageConstruct('chained boolean operators ... are not supported')`. The final nested-condition
+    form compiled and was used for the performance result below.
+- Effect:
+  - Final nested-condition version:
+    - `python3 -m py_compile flash_attention_forward.py`: pass.
+    - `git diff --check`: pass.
+    - Correctness suite: `18/18` passed in
+      `evaluation_reports/codex_point_new_lazyfuse3_correctness/evaluation_report.json`.
+    - Performance suite: `6/6` matched in
+      `evaluation_reports/codex_point_new_lazyfuse3_performance/evaluation_report.json`.
+    - Submit-style performance score regressed from active best `22.506673665520136 / 60` to
+      `21.41294238431406 / 60`.
+    - Mean speedup regressed from `0.37511122775866895` to `0.356882373071901`.
+    - Median speedup regressed from `0.367469250279431` to `0.34970985338101174`.
+  - Per-shape speedups after the valid experiment:
+    - `(128,8,1024,128, causal=True)`: `0.2860793263628685 -> 0.2741127110780622`.
+    - `(128,8,1024,256, causal=True)`: `0.2908101646927782 -> 0.2794035607706744`.
+    - `(128,8,2048,128, causal=True)`: `0.3271592699844636 -> 0.31131911122862344`.
+    - `(128,8,2048,256, causal=False)`: `0.4879122341826647 -> 0.46700119698189846`.
+    - `(128,8,4096,128, causal=False)`: `0.40777923057439847 -> 0.38810059553340004`.
+    - `(128,8,8192,64, causal=False)`: `0.4509271407548402 -> 0.42135706283874746`.
+- Issues:
+  - The targeted D128 causal 1024 case itself slowed by about 4.2% speedup ratio, so the fused
+    `tl.dot(..., acc_ptr)` form remains better for the lazy UB path.
+  - The source-level nested specialization also perturbed unrelated fallback timings in the full evaluator run.
+  - Triton-Ascend rejects chained boolean conditions in JIT expressions even when they are only over `tl.constexpr`
+    values; future narrow compile-time predicates should use a host-provided single boolean or plain nested `if` blocks.
+  - The temporary source change was reverted. Keep the current `LAZY_FUSE` footprint heuristic unchanged.
+- Reports:
+  - `evaluation_reports/codex_point_new_lazyfuse_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point_new_lazyfuse_performance/evaluation_report.json`
+  - `evaluation_reports/codex_point_new_lazyfuse2_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point_new_lazyfuse3_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point_new_lazyfuse3_performance/evaluation_report.json`
