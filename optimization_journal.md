@@ -2642,3 +2642,48 @@
 - Reports:
   - `evaluation_reports/codex_point25_d256_parity_sync_params_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point25_d256_parity_sync_params_performance/evaluation_report.json`
+
+## 2026-07-26 - Optimization point 25: D128 causal 1024 full-CV current-baseline regression
+
+- Commit: journal-only commit for this entry; source was reverted after performance validation.
+- Optimization point: 25, IR/profile-guided compile-parameter specialization, retested narrowly on the current
+  no-LSE/log-elided D128 causal `N_CTX=1024` hz-major family.
+- Motivation:
+  - The current D128 causal 1024 profile remains scalar/sync heavy:
+    `aic_scalar_ratio=0.609`, `aic_mte2_ratio=0.397`, `aiv_scalar_ratio=0.385`, and `sync_avg_us=10899.674`.
+  - A previous pre-no-LSE run showed the full CV bundle helped the `N_CTX=2048` D128 causal branch but did not clearly
+    help `N_CTX=1024`. This retest checked whether the current no-LSE/log-elided source shape changed that decision.
+- Content:
+  - Temporarily added the same compatible full CV parameter bundle used by the D128 `N_CTX=2048` branch to only the
+    `use_causal_hz_major_family and n_ctx == 1024` launch:
+    `multibuffer=True`, `enable_mixed_cv=True`, `enable_auto_bind_sub_block=True`, `sync_solver=True`,
+    `limit_auto_multi_buffer_of_local_buffer="no-limit"`, and `set_workspace_multibuffer=2`.
+  - Kept tiling, math, D256 parity routing, generic fallback, no-LSE behavior, and `DEFAULT_PERSISTENT_PROGRAMS = 20`
+    unchanged.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point25_d128_1024_full_cv_current_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point25_d128_1024_full_cv_current_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.506673665520136 / 60` to
+    `21.636485837928422 / 60`.
+  - Mean speedup regressed from `0.37511122775866895` to `0.360608097298807`.
+  - Per-shape speedups after the experiment:
+    - `(128,8,1024,128, causal=True)`: `0.2813864756273018` (targeted D128 1024 family, below active best
+      `0.2860793263628685`).
+    - `(128,8,1024,256, causal=True)`: `0.28281860008360254`.
+    - `(128,8,2048,128, causal=True)`: `0.31376573362070004`.
+    - `(128,8,2048,256, causal=False)`: `0.46962375358024333`.
+    - `(128,8,4096,128, causal=False)`: `0.39007173241697524`.
+    - `(128,8,8192,64, causal=False)`: `0.42598228846401914`.
+- Issues:
+  - The target D128 1024 branch still prefers the no-parameter hz-major launch. The full CV bundle perturbs scheduling
+    enough to slow both the target case and the aggregate score.
+  - This confirms the existing point 14 strategy split remains valid on the current no-LSE/log-elided baseline:
+    `N_CTX=1024` stays no-param, `N_CTX=2048` keeps the full CV parameter bundle.
+  - The temporary source change was reverted.
+- Reports:
+  - `evaluation_reports/codex_point25_d128_1024_full_cv_current_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point25_d128_1024_full_cv_current_performance/evaluation_report.json`
