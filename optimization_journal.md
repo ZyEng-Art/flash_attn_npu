@@ -2388,3 +2388,50 @@
   - `evaluation_reports/codex_point18_d128_local_diag1024_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point18_d128_local_diag1024_performance/evaluation_report.json`
   - `evaluation_reports/codex_point18_d128_local_diag1024_performance_r2/evaluation_report.json`
+
+## 2026-07-26 - Optimization point 18: D256 non-causal no-index-loop family regression
+
+- Commit: journal-only commit for this entry; source was reverted because both the target shape and aggregate score
+  regressed.
+- Optimization point: 18, kernel splitting / kernel family specialization, tested narrowly on the D256 non-causal
+  performance shape `(128, 8, 2048, 256, causal=False)`.
+- Motivation:
+  - The existing D256 non-causal mask-index-elision family is one of the few positive non-causal source-level changes,
+    and the remaining D256 path still uses the generic `_attn_fwd` wrapper with compile-time branches for stage,
+    accumulator residency, stable/lazy softmax, and causal masking.
+  - Hypothesis: a dedicated D256 non-causal kernel family could keep the same tiling `(BM=128, BN=128)` and math while
+    removing unused branch shapes and the explicit `start_n = tl.multiple_of(start_n, BLOCK_N)` loop-index work from
+    the hot KV loop.
+- Content:
+  - Temporarily added `_attn_fwd_noncausal_d256_tile` and `_attn_fwd_noncausal_d256`.
+  - The specialized tile fixed `HEAD_DIM=256`, `BLOCK_M=128`, `BLOCK_N=128`, `USE_MAX=False`, `ACC_IN_UB=False`, and
+    non-causal full-context traversal at compile time.
+  - The KV loop used `for _ in tl.range(0, N_CTX, BLOCK_N)` with pointer advancement only, so no `curr_n` or
+    `tl.multiple_of(start_n, BLOCK_N)` value was materialized.
+  - Host routing was restricted to `(z, h, n_ctx, head_dim, causal) == (128, 8, 2048, 256, False)` with the current
+    preset tiling and lazy GM accumulator. D128/D64 non-causal paths, D128 causal hz-major, D256 causal parity split,
+    compile parameters, tiling presets, and `DEFAULT_PERSISTENT_PROGRAMS = 20` were unchanged.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point18_d256_noncausal_loop_family_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point18_d256_noncausal_loop_family_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.43424911157306 / 60` to
+    `21.506431258896917 / 60`.
+  - Mean speedup regressed from `0.373904151859551` to `0.3584405209816153`.
+  - Median speedup regressed from `0.3661752970191059` to `0.3511130638715788`.
+  - Targeted D256 non-causal speedup regressed from `0.48396344081902276` to `0.4715778906089937`;
+    candidate median latency worsened from `72616.715450 us` to `74976.405129 us`.
+- Issues:
+  - The generic branch/index shape was not the limiting factor for this D256 non-causal case; duplicating the loop into a
+    separate family likely worsened lowering/scheduling and lost the benefit of the existing generic code shape.
+  - All other performance shapes measured lower in the same run even though they were not routed to the new family, so
+    this experiment also had an unfavorable full-run environment. The target shape itself regressed, so no rerun was
+    needed for the adoption decision.
+  - Do not retry this "no-index-loop" specialization for D256 non-causal without fresh IR evidence that the loop index is
+    still present in the optimized IR and dominates scalar cost.
+- Reports:
+  - `evaluation_reports/codex_point18_d256_noncausal_loop_family_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point18_d256_noncausal_loop_family_performance/evaluation_report.json`
