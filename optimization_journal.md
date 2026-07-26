@@ -2283,3 +2283,56 @@
   - `evaluation_reports/codex_point18_d256_diag_parity_split_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point18_d256_diag_parity_split_performance/evaluation_report.json`
   - `evaluation_reports/codex_point18_d256_diag_parity_split_performance_r2/evaluation_report.json`
+
+## 2026-07-26 - Optimization point 18: D128 causal 1024 modulo-4 phase family regression
+
+- Commit: journal-only commit for this entry; source was reverted after the performance regression.
+- Optimization point: 18, kernel splitting / kernel family specialization, tested narrowly on the D128 causal
+  `N_CTX=1024` hz-major path.
+- Motivation:
+  - The D128 causal hz-major IR showed relatively high synchronization and scalar/index overhead:
+    `sync_block_set=24`, `sync_block_wait=24`, `wait_flag=50`, `set_flag=50`, `pipe_barrier=19`,
+    `arith.index_cast=40`, `arith.muli=26`, and `arith.divsi=12`.
+  - Since the D256 causal parity split improved its target shape, the analogous D128 idea was to split the diagonal
+    tile phase by `task_m_idx % 4` for `BM=64`, `BN=256`.
+  - Hypothesis: specializing `TILE_PHASE=0..3` would make the diagonal mask shape compile-time fixed and reduce dynamic
+    index/mask work on `(128, 8, 1024, 128, causal=True)`.
+- Content:
+  - Temporarily added `_attn_fwd_causal_hz_phase_tile` and `_attn_fwd_causal_hz_phase`.
+  - The phase tile mapped `task_m_idx = task_group_idx * 4 + TILE_PHASE`, avoided `%` in Triton code, and used a local
+    diagonal mask comparing `TILE_PHASE * BLOCK_M + arange(BLOCK_M)` against `arange(BLOCK_N)`.
+  - Temporarily routed only `use_causal_hz_major_family and n_ctx == 1024` to four sequential
+    `_attn_fwd_causal_hz_phase` launches with `TILE_PHASE=0..3`.
+  - Left the D128 `N_CTX=2048` full CV-parameter branch, D256 parity split, generic fallback, tiling presets, and
+    `DEFAULT_PERSISTENT_PROGRAMS = 20` unchanged.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point18_d128_phase1024_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point18_d128_phase1024_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.43424911157306 / 60` to
+    `20.5853183615137 / 60`.
+  - Mean speedup regressed from `0.373904151859551` to `0.34308863935856165`.
+  - Median speedup regressed from `0.3661752970191059` to `0.3502905776046385`.
+  - The targeted D128 causal 1024 shape regressed sharply from speedup `0.2862688260353736` to
+    `0.18938428477985841`; candidate median latency worsened from `10483.604856 us` to `15848.594718 us`.
+  - Other measured shape deltas in the same run also moved negative, likely due to global timing/load noise after the
+    first shape slowed substantially:
+    - D256 causal 1024 speedup `0.29087665397851187` -> `0.27985987932454764`.
+    - D128 causal 2048 speedup `0.3265679147525726` -> `0.31204572947622167`.
+    - D256 non-causal 2048 speedup `0.48396344081902276` -> `0.46646457570291405`.
+    - D128 non-causal 4096 speedup `0.40578267928563927` -> `0.38853542573305533`.
+    - D64 non-causal 8192 speedup `0.449965396286186` -> `0.4222419411347727`.
+- Issues:
+  - Four sequential phase launches dominate any benefit from the compile-time local diagonal mask.
+  - Splitting a D128 `BN=256` diagonal tile into modulo-4 phases is not analogous to the successful D256 parity split:
+    D256 parity still used two launches and reduced an empty/half diagonal loop shape; D128 phase split introduced four
+    launches and lost too much scheduling/KV locality.
+  - The source change was reverted. Future D128 work should avoid multi-launch phase splitting and instead focus on a
+    single-launch source-shape simplification or profile-guided compile-param changes inside the existing hz-major
+    family.
+- Reports:
+  - `evaluation_reports/codex_point18_d128_phase1024_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point18_d128_phase1024_performance/evaluation_report.json`
