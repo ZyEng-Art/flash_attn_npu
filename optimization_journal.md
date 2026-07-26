@@ -2224,3 +2224,62 @@
 - Reports:
   - `evaluation_reports/codex_point25_d128_2048_multibuffer_only_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point25_d128_2048_multibuffer_only_performance/evaluation_report.json`
+
+## 2026-07-26 - Optimization point 18: D256 causal diag-split parity kernel family
+
+- Commit: source + journal commit for this positive optimization.
+- Optimization point: 18, kernel splitting / kernel family specialization, applied narrowly to the D256 causal
+  diag-split path.
+- Motivation:
+  - The D256 causal profile for `_attn_fwd_causal_diag_split` showed high scalar/MTE/sync pressure even though cube
+    utilization was already high: `aic_scalar_ratio=0.5828`, `aic_mte2_ratio=0.413`,
+    `aiv_scalar_ratio=0.3769`, `Wait Time(us)=561.770`, and `cube_utilization(%)=98.0739`.
+  - Previous attempts ruled out broad D256 compile parameters because the multi-buffer/CV bundle hit CC overflow
+    (`1572864 bits > 1048576 bits`), and persistent-program A/B showed `DEFAULT_PERSISTENT_PROGRAMS = 20` remained best.
+  - The remaining structural issue in diag-split was that one kernel covered both even and odd M tiles. Even tiles have
+    no half-width pre-diagonal loop, while odd tiles always have one half-width pre-diagonal loop. Hypothesis: splitting
+    this parity at compile time could remove the runtime empty-loop/parity shape from the hot D256 path without changing
+    math or tiling.
+- Content:
+  - Added `_attn_fwd_causal_diag_split_parity_tile` and `_attn_fwd_causal_diag_split_parity`.
+  - The parity kernel maps `task_m_idx = task_pair_idx * 2 + TILE_PARITY`, avoiding modulo in Triton code.
+  - `TILE_PARITY=0` compiles a path where `full_hi = diag_lo` and skips the half-width pre-diagonal loop.
+  - `TILE_PARITY=1` compiles a path where `full_hi = diag_lo - BLOCK_M` and keeps the fixed half-width
+    pre-diagonal loop.
+  - Host routing is intentionally narrow: only
+    `(z, h, n_ctx, head_dim, causal) == (128, 8, 1024, 256, True)` with `BM=64`, `BN=128`, lazy mode, and
+    `acc_in_ub=True` launches the two parity kernels. Other D256 causal shapes keep the original
+    `_attn_fwd_causal_diag_split` fallback.
+  - Did not change generic `_attn_fwd`, D128 hz-major branches, compile parameters, tiling presets, or
+    `DEFAULT_PERSISTENT_PROGRAMS = 20`.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point18_d256_diag_parity_split_correctness/evaluation_report.json`.
+  - Performance run 1: `6/6` matched in
+    `evaluation_reports/codex_point18_d256_diag_parity_split_performance/evaluation_report.json`.
+    - Submit-style performance score: `22.389497086109618 / 60`, below the active best
+      `22.400443902045232 / 60`.
+    - Mean speedup: `0.3731582847684936`; median speedup: `0.36581490624515356`.
+    - Targeted D256 causal speedup improved from `0.28726495791201` to `0.28968493339333473`;
+      candidate median latency improved from `17099.735327 us` to `16923.800576 us`.
+  - Performance run 2: `6/6` matched in
+    `evaluation_reports/codex_point18_d256_diag_parity_split_performance_r2/evaluation_report.json`.
+    - Submit-style performance score: `22.43424911157306 / 60`, above the active best
+      `22.400443902045232 / 60`.
+    - Mean speedup: `0.373904151859551`; median speedup: `0.3661752970191059`.
+    - Targeted D256 causal speedup improved from `0.28726495791201` to `0.29087665397851187`;
+      candidate median latency improved from `17099.735327 us` to `16936.045140 us`.
+- Issues:
+  - Full performance remains noisy: the first full run was slightly below best because unrelated D128/non-causal shapes
+    moved in opposite directions, while the second run was above best.
+  - The target D256 causal shape improved in both runs, which is the only shape this source change routes differently.
+  - Splitting by parity doubles launches for that one shape, but the measured target latency still improved, so launch
+    overhead did not dominate this evaluator case.
+  - This confirms the D256 path is more responsive to lower-footprint source-shape specialization than to compile-param
+    tuning.
+- Reports:
+  - `evaluation_reports/codex_point18_d256_diag_parity_split_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point18_d256_diag_parity_split_performance/evaluation_report.json`
+  - `evaluation_reports/codex_point18_d256_diag_parity_split_performance_r2/evaluation_report.json`
