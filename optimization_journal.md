@@ -2598,3 +2598,47 @@
   - `evaluation_reports/codex_point18_no_lse_log_elide_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point18_no_lse_log_elide_performance/evaluation_report.json`
   - `evaluation_reports/codex_point18_no_lse_log_elide_performance_r2/evaluation_report.json`
+
+## 2026-07-26 - Optimization point 25: D256 parity sync-only compile-param regression
+
+- Commit: journal-only commit for this entry; source was reverted after the target family and aggregate score regressed.
+- Optimization point: 25, IR/profile-guided compile-parameter specialization, tested narrowly on the existing D256
+  causal diag-split parity family.
+- Motivation:
+  - The earlier D256 causal profile for the pre-parity diag-split path showed high scalar/MTE/sync pressure:
+    `aic_scalar_ratio=0.583`, `aic_mte2_ratio=0.413`, `aiv_scalar_ratio=0.377`, and `sync_avg_us=16731.609`.
+  - The full D128 CV compile-parameter bundle previously failed on D256 diag-split with CC overflow, so this probe used
+    only the lighter sync/scheduling hints and left out `multibuffer`, `limit_auto_multi_buffer_of_local_buffer`, and
+    `set_workspace_multibuffer`.
+- Content:
+  - Temporarily added `enable_mixed_cv=True`, `enable_auto_bind_sub_block=True`, and `sync_solver=True` to the two
+    `_attn_fwd_causal_diag_split_parity[grid]` launches for `TILE_PARITY=0` and `TILE_PARITY=1`.
+  - Kept tiling, math, `STORE_LSE`, D128 hz-major routing, D256 parity source code, generic fallback, and
+    `DEFAULT_PERSISTENT_PROGRAMS = 20` unchanged.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point25_d256_parity_sync_params_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point25_d256_parity_sync_params_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.506673665520136 / 60` to `22.245 / 60`.
+  - Mean speedup regressed from `0.37511122775866895` to `0.3708`.
+  - Per-shape speedups after the experiment:
+    - `(128,8,1024,128, causal=True)`: `0.2832675002826651`.
+    - `(128,8,1024,256, causal=True)`: `0.28683603204530184` (targeted D256 parity family, below active best
+      `0.2908101646927782`).
+    - `(128,8,2048,128, causal=True)`: `0.32602213845276395`.
+    - `(128,8,2048,256, causal=False)`: `0.4745716480916879`.
+    - `(128,8,4096,128, causal=False)`: `0.407117671601809`.
+    - `(128,8,8192,64, causal=False)`: `0.4466912047463913`.
+- Issues:
+  - The target D256 causal parity family slowed down, so the sync-only CV hints are not a valid follow-up to the positive
+    parity split.
+  - This matches the broader pattern seen in prior compile-param ablations: without the full multibuffer/workspace bundle
+    the sync hints alone often perturb scheduling negatively, while the full bundle is too memory-heavy for D256.
+  - The temporary source change was reverted. Keep the current no-parameter parity launches unless fresh IR from the
+    parity family itself shows a different supported compile parameter is needed.
+- Reports:
+  - `evaluation_reports/codex_point25_d256_parity_sync_params_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point25_d256_parity_sync_params_performance/evaluation_report.json`
