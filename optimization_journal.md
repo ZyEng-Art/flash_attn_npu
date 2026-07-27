@@ -2783,3 +2783,50 @@
   - `evaluation_reports/codex_point_new_lazyfuse2_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point_new_lazyfuse3_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point_new_lazyfuse3_performance/evaluation_report.json`
+
+## 2026-07-27 - Optimization point 11: K/V tile multibuffer hint regression
+
+- Commit: journal-only commit for this entry; source was reverted after performance validation.
+- Optimization point: 11, load instruction scheduling / CV pipeline hinting.
+- Motivation:
+  - Current profiles for the active best still show high scalar/MTE/sync pressure rather than a clean MMAD limit.
+  - The historical `origin/ping-pong` prototype used `extension.multibuffer` on K/V tile loads, while the current
+    no-LSE/lazy source no longer contains any explicit `extension.multibuffer(k/v, 2)` hint.
+  - Hypothesis: adding a compiler multibuffer hint immediately after the current K/V `tl.load` operations could improve
+    MTE/Cube overlap without changing math, tiling, host dispatch, workspace policy, or persistent program count.
+- Content:
+  - Temporarily added exactly two statements in `_attn_fwd_inner_loop()` after:
+    `k = tl.load(k_block_ptr)` and `v = tl.load(v_block_ptr)`:
+    `extension.multibuffer(k, 2)` and `extension.multibuffer(v, 2)`.
+  - Kept `DEFAULT_PERSISTENT_PROGRAMS = 20`, all current tiling presets, D128 hz-major routing, D128 2048 CV bundle,
+    D256 causal parity split, non-causal D256 index elision, no-LSE store/log elision, and lazy/stable math unchanged.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Checklist review: the change did not add int64 arithmetic, comparisons, division/modulo, extra grid dimensions,
+    interleaved task partitioning, mutable loop-index updates, `break`, or `continue`.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point11_kv_multibuffer_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point11_kv_multibuffer_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.506673665520136 / 60` to
+    `22.373042468024238 / 60`.
+  - Mean speedup regressed from `0.37511122775866895` to `0.3728840411337373`.
+  - Median speedup changed from `0.367469250279431` to `0.3686039322955988`.
+  - Per-shape speedups after the experiment:
+    - `(128,8,1024,128, causal=True)`: `0.2860793263628685 -> 0.2860112042999078`.
+    - `(128,8,1024,256, causal=True)`: `0.2908101646927782 -> 0.2928372287945872`.
+    - `(128,8,2048,128, causal=True)`: `0.3271592699844636 -> 0.32656337324272394`.
+    - `(128,8,2048,256, causal=False)`: `0.4879122341826647 -> 0.47364539534251276`.
+    - `(128,8,4096,128, causal=False)`: `0.40777923057439847 -> 0.41064449134847364`.
+    - `(128,8,8192,64, causal=False)`: `0.4509271407548402 -> 0.44760255377421837`.
+- Issues:
+  - The hint helped the D256 causal case and slightly helped D128 non-causal, but it slowed D256 non-causal and D64
+    long non-causal enough to reduce the aggregate evaluator score.
+  - The current scheduler already overlaps the early K/V loads well enough in the wide-lazy-GM paths; explicit
+    multibuffer likely changes live ranges or buffering decisions in a way that hurts the GM-accumulator families.
+  - Keep the current plain `tl.load(k_block_ptr)` / `tl.load(v_block_ptr)` source shape unless fresh IR shows a specific
+    family where the hint reduces wait/barrier time without perturbing the long non-causal schedules.
+- Reports:
+  - `evaluation_reports/codex_point11_kv_multibuffer_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point11_kv_multibuffer_performance/evaluation_report.json`
