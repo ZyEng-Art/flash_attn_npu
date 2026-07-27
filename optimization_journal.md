@@ -2995,3 +2995,59 @@
 - Reports:
   - `evaluation_reports/codex_point18_d256_parity_lazy_inner_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point18_d256_parity_lazy_inner_performance/evaluation_report.json`
+
+## 2026-07-27 - Optimization point 25: D128 2048 VF membar-removal regression
+
+- Commit: journal-only commit for this entry; source was reverted after performance validation.
+- Optimization point: 25, IR/profile-guided compile-parameter specialization, tested narrowly on the existing D128
+  causal `N_CTX=2048` hz-major full-CV branch.
+- Motivation:
+  - Current IR for `_attn_fwd_causal_hz_major` still shows high sync/barrier density:
+    `sync_block_set=24`, `sync_block_wait=24`, `wait_flag=50`, `set_flag=50`, `pipe_barrier=19`.
+  - The same branch already uses the compatible full CV bundle
+    (`multibuffer=True`, `enable_mixed_cv=True`, `enable_auto_bind_sub_block=True`, `sync_solver=True`,
+    `limit_auto_multi_buffer_of_local_buffer="no-limit"`, `set_workspace_multibuffer=2`), but does not use the
+    supported auxiliary `NPUOptions` parameter `enable_cce_vf_remove_membar`.
+  - Hypothesis: enabling only `enable_cce_vf_remove_membar=True` on the D128 2048 branch might remove redundant VF
+    memory barriers and reduce sync overhead without changing math, tiling, workspace allocation, persistent programs, or
+    other kernel families.
+- Content:
+  - Temporarily added one launch option to the `use_causal_hz_major_family` `N_CTX=2048` branch:
+    `enable_cce_vf_remove_membar=True`.
+  - Left the `N_CTX=1024` D128 hz-major branch without CV parameters, kept the D256 parity split, generic fallback,
+    no-LSE store/log elision, tiling presets, K/V load ordering, and `DEFAULT_PERSISTENT_PROGRAMS = 20` unchanged.
+  - Confirmed from local `NPUOptions` that `enable_cce_vf_remove_membar` is a supported keyword. Also confirmed that
+    `enable_loop_flatten` is not a supported Python launch option, so the earlier backend hint for
+    `--enable-loop-flatten=False` was not used.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Checklist review: this change did not add int64 arithmetic, comparisons, division/modulo, extra grid dimensions,
+    interleaved task partitioning, mutable loop-index updates, `break`, or `continue`; it only changed one supported
+    launch option.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point25_d128_2048_remove_membar_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point25_d128_2048_remove_membar_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.506673665520136 / 60` to
+    `22.30340686918956 / 60`.
+  - Mean speedup regressed from `0.37511122775866895` to `0.37172344781982597`.
+  - Median speedup regressed from `0.367469250279431` to `0.36649244789956636`.
+  - Per-shape speedups after the experiment:
+    - `(128,8,1024,128, causal=True)`: `0.2860793263628685 -> 0.28400386120233784`.
+    - `(128,8,1024,256, causal=True)`: `0.2908101646927782 -> 0.2894978635963786`.
+    - `(128,8,2048,128, causal=True)`: `0.3271592699844636 -> 0.3260023866856263`.
+    - `(128,8,2048,256, causal=False)`: `0.4879122341826647 -> 0.47489801184443053`.
+    - `(128,8,4096,128, causal=False)`: `0.40777923057439847 -> 0.40698250911350636`.
+    - `(128,8,8192,64, causal=False)`: `0.4509271407548402 -> 0.4489560544766761`.
+- Issues:
+  - The target D128 2048 branch slowed slightly, so the extra barrier-removal hint does not improve the existing
+    full-CV schedule.
+  - The larger aggregate loss came from unrelated fallback shapes in the same full performance run, which again shows that
+    compile-option perturbations can shift global lowering/cache behavior even when source routing is narrow.
+  - Treat `enable_cce_vf_remove_membar=True` as rejected for the D128 2048 full-CV branch. Future sync work should require
+    fresh IR after a source change, not additional standalone VF sync flags on this branch.
+  - The temporary source change was reverted.
+- Reports:
+  - `evaluation_reports/codex_point25_d128_2048_remove_membar_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point25_d128_2048_remove_membar_performance/evaluation_report.json`
