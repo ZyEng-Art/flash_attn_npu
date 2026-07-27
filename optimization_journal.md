@@ -2934,3 +2934,64 @@
 - Reports:
   - `evaluation_reports/codex_point11_family_kv_multibuffer_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point11_family_kv_multibuffer_performance/evaluation_report.json`
+
+## 2026-07-27 - Optimization point 18: D256 parity lazy inner-loop regression
+
+- Commit: journal-only commit for this entry; source was reverted after performance validation.
+- Optimization point: 18, kernel family specialization / kernel splitting, narrowed to the existing D256 causal
+  parity-split family.
+- Motivation:
+  - The D256 causal parity split route is already a shape-specialized positive family for
+    `(Z=128,H=8,N_CTX=1024,HEAD_DIM=256,causal=True)`.
+  - That route still called the shared `_attn_fwd_inner_loop()` with fixed lazy-softmax parameters
+    (`ACC_IN_UB=True`, `USE_MAX=False`, non-fp8), so the backend still had to lower a generic helper carrying
+    unused max-rescale and optional mask-index paths.
+  - Hypothesis: replacing the parity tile's three inner segments with a dedicated D256 lazy UB helper would simplify
+    lowering, reduce dead control/data paths, and improve the target D256 causal scored case without affecting other
+    families.
+- Content:
+  - Temporarily added `_attn_fwd_inner_loop_d256_lazy_ub()`, a fixed lazy-softmax inner loop that:
+    - Keeps `acc_ptr` resident in UB and updates it with `tl.dot(p_cast, v, acc_ptr)`.
+    - Drops `m_i` threading, `USE_MAX`, `ACC_IN_UB`, fp8, and unused-mask-index parameters.
+    - Uses `p = tl.math.exp(qk - 6.0)` and `l_i += tl.sum(p, axis=1)`, matching the existing lazy path.
+    - Computes K/V block pointers from `start_n` each iteration to avoid adding a new mutable pointer-update chain.
+  - Routed only `_attn_fwd_causal_diag_split_parity_tile()` through the dedicated helper for the off-band,
+    parity pre-diagonal, and masked diagonal segments.
+  - Kept the non-parity D256 diag-split route on the shared helper.
+  - Restricted the parity route to `return_lse=False` during the experiment so the lazy helper would not corrupt
+    LSE semantics by leaving `m_i` at `-inf`.
+  - Kept tiling, D128 hz-major routing, D128 2048 CV bundle, D256 non-causal mask-index elision, D64 long non-causal,
+    no-LSE store/log elision, K/V load ordering, and `DEFAULT_PERSISTENT_PROGRAMS = 20` otherwise unchanged.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Checklist review: the new helper used fp32 comparison for the causal mask, did not add int64 arithmetic, modulo,
+    multi-dimensional grid, interleaved task partitioning, `break`, or `continue`, and avoided a new mutable loop-index
+    pointer update by deriving K/V block pointers from `start_n`.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point18_d256_parity_lazy_inner_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point18_d256_parity_lazy_inner_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.506673665520136 / 60` to
+    `21.440576856380076 / 60`.
+  - Mean speedup regressed from `0.37511122775866895` to `0.35734294760633456`.
+  - Median speedup regressed from `0.367469250279431` to `0.3493109701105135`.
+  - Per-shape speedups after the experiment:
+    - `(128,8,1024,128, causal=True)`: `0.2860793263628685 -> 0.27379257921268113`.
+    - `(128,8,1024,256, causal=True)`: `0.2908101646927782 -> 0.27869473563428643`.
+    - `(128,8,2048,128, causal=True)`: `0.3271592699844636 -> 0.31128821371259396`.
+    - `(128,8,2048,256, causal=False)`: `0.4879122341826647 -> 0.4687304417567062`.
+    - `(128,8,4096,128, causal=False)`: `0.40777923057439847 -> 0.38733372650843295`.
+    - `(128,8,8192,64, causal=False)`: `0.4509271407548402 -> 0.42421798881330675`.
+- Issues:
+  - All six scored shapes slowed, even though only the D256 causal parity source path changed. The shared source
+    perturbation and new helper likely changed compilation/cache/lowering behavior enough to worsen aggregate timing,
+    while the target D256 causal case also failed to improve.
+  - The generic helper's extra constexpr parameters are apparently not the current bottleneck; removing them did not
+    reduce the observed vector/sync pressure and may have hurt scheduling or code layout.
+  - Treat D256 parity "clone the inner loop and delete generic parameters" as rejected. Future parity work should use
+    fresh simulator/IR evidence for a specific hot line rather than further source-shape simplification.
+  - The temporary source change was reverted.
+- Reports:
+  - `evaluation_reports/codex_point18_d256_parity_lazy_inner_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point18_d256_parity_lazy_inner_performance/evaluation_report.json`
