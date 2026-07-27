@@ -3051,3 +3051,53 @@
 - Reports:
   - `evaluation_reports/codex_point25_d128_2048_remove_membar_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point25_d128_2048_remove_membar_performance/evaluation_report.json`
+
+## 2026-07-27 - Optimization point 25: D128 2048 HIVM auto-CV-balance regression
+
+- Commit: journal-only commit for this entry; source was reverted after performance validation.
+- Optimization point: 25, IR/profile-guided compile-parameter specialization, tested narrowly on the existing D128
+  causal `N_CTX=2048` hz-major full-CV branch.
+- Motivation:
+  - Current IR for `_attn_fwd_causal_hz_major` still reports a mixed Cube/Vector schedule with nontrivial sync density:
+    `sync_block_set=24`, `sync_block_wait=24`, `wait_flag=50`, `set_flag=50`, `pipe_barrier=19`.
+  - The compile-parameter guide lists `enable_hivm_auto_cv_balance` as an auxiliary option for automatic HIVM CV load
+    balancing. It had not been tested on top of the existing positive full-CV bundle for the D128 2048 branch.
+  - Hypothesis: enabling only `enable_hivm_auto_cv_balance=True` on that branch might improve Cube/Vector balance without
+    changing math, tiling, workspace allocation, persistent program count, or other kernel families.
+- Content:
+  - Temporarily added one launch option to the `use_causal_hz_major_family` `N_CTX=2048` branch:
+    `enable_hivm_auto_cv_balance=True`.
+  - Kept the `N_CTX=1024` D128 hz-major branch no-param, retained the D256 parity split, generic fallback, no-LSE
+    store/log elision, tiling presets, K/V load ordering, and `DEFAULT_PERSISTENT_PROGRAMS = 20`.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Checklist review: this change only added one supported launch option and did not introduce int64 arithmetic,
+    comparisons, division/modulo, extra grid dimensions, interleaved task partitioning, mutable loop-index updates,
+    `break`, or `continue`.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point25_d128_2048_auto_cv_balance_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point25_d128_2048_auto_cv_balance_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.506673665520136 / 60` to
+    `21.486031279005772 / 60`.
+  - Mean speedup regressed from `0.37511122775866895` to `0.35810052131676284`.
+  - Median speedup regressed from `0.367469250279431` to `0.3505495797247071`.
+  - Per-shape speedups after the experiment:
+    - `(128,8,1024,128, causal=True)`: `0.2860793263628685 -> 0.27404116511549004`.
+    - `(128,8,1024,256, causal=True)`: `0.2908101646927782 -> 0.28029132626573844`.
+    - `(128,8,2048,128, causal=True)`: `0.3271592699844636 -> 0.31360732652846185`.
+    - `(128,8,2048,256, causal=False)`: `0.4879122341826647 -> 0.4670290962685317`.
+    - `(128,8,4096,128, causal=False)`: `0.40777923057439847 -> 0.38749183292095235`.
+    - `(128,8,8192,64, causal=False)`: `0.4509271407548402 -> 0.4261423808014026`.
+- Issues:
+  - The target D128 2048 branch itself slowed substantially, so HIVM auto CV balancing conflicts with the existing
+    hand-selected full-CV parameter bundle for this kernel.
+  - All six scored shapes slowed, indicating that this option shifts backend scheduling/lowering globally enough to hurt
+    even families whose source dispatch was not intended to change.
+  - Treat `enable_hivm_auto_cv_balance=True` as rejected for this FlashAttention forward implementation unless a future
+    backend changes the pass behavior and fresh IR proves it removes a concrete critical-path imbalance.
+  - The temporary source change was reverted.
+- Reports:
+  - `evaluation_reports/codex_point25_d128_2048_auto_cv_balance_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point25_d128_2048_auto_cv_balance_performance/evaluation_report.json`
