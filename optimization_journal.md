@@ -2884,3 +2884,53 @@
 - Reports:
   - `evaluation_reports/codex_point6_final_norm_recip_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point6_final_norm_recip_performance/evaluation_report.json`
+
+## 2026-07-27 - Optimization point 11: family-gated K/V multibuffer regression
+
+- Commit: journal-only commit for this entry; source was reverted after performance validation.
+- Optimization point: 11, load instruction scheduling / CV pipeline hinting, narrowed with a kernel-family gate.
+- Motivation:
+  - The previous broad K/V `extension.multibuffer(k/v, 2)` probe regressed overall but showed mixed per-shape signals:
+    D256 causal and D128 non-causal improved slightly, while D256 non-causal and D64 long non-causal regressed.
+  - Hypothesis: moving the hint behind a `tl.constexpr` family gate could preserve the positive families while avoiding
+    the known negative wide-GM families.
+- Content:
+  - Temporarily added a `KV_MULTIBUFFER` constexpr through `_attn_fwd_inner_loop()`, `_attn_fwd_inner()`,
+    `_attn_fwd_tile()`, `_attn_fwd()`, and `_attn_fwd_causal_hz_major()`.
+  - Added `extension.multibuffer(k, 2)` and `extension.multibuffer(v, 2)` immediately after the K/V tile loads only when
+    `KV_MULTIBUFFER=True`.
+  - Routed `KV_MULTIBUFFER=True` only for:
+    - D256 causal parity split family, where the broad probe had improved the target case.
+    - D128 non-causal wide-lazy-GM generic family (`HEAD_DIM=128`, `BM=128`, `BN=256`, lazy, GM accumulator).
+  - Kept D128 causal hz-major, D128 2048 CV bundle, D256 non-causal mask-index elision, D64 long non-causal, tiling,
+    no-LSE store/log elision, and `DEFAULT_PERSISTENT_PROGRAMS = 20` otherwise unchanged.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Checklist review: the change did not add int64 arithmetic, integer compare/divide/modulo, extra grid dimensions,
+    interleaved task partitioning, mutable loop-index updates, `break`, or `continue`.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point11_family_kv_multibuffer_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point11_family_kv_multibuffer_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.506673665520136 / 60` to
+    `22.46580558513983 / 60`.
+  - Mean speedup regressed from `0.37511122775866895` to `0.37443009308566383`.
+  - Median speedup regressed from `0.367469250279431` to `0.36708900726070165`.
+  - Per-shape speedups after the experiment:
+    - `(128,8,1024,128, causal=True)`: `0.2860793263628685 -> 0.2873642562985733`.
+    - `(128,8,1024,256, causal=True)`: `0.2908101646927782 -> 0.29008734300447553`.
+    - `(128,8,2048,128, causal=True)`: `0.3271592699844636 -> 0.3271064679575822`.
+    - `(128,8,2048,256, causal=False)`: `0.4879122341826647 -> 0.48616456755727516`.
+    - `(128,8,4096,128, causal=False)`: `0.40777923057439847 -> 0.4070715465638211`.
+    - `(128,8,8192,64, causal=False)`: `0.4509271407548402 -> 0.4487863771322557`.
+- Issues:
+  - The family gate avoided the large broad regression but still did not exceed the current best aggregate score.
+  - The D256 causal target no longer reproduced the broad-run gain, and the D128 non-causal target also drifted slightly
+    below best. This suggests the broad run's small per-shape positives were not robust enough to justify adding a new
+    constexpr through the shared call stack.
+  - Keep K/V loads plain in the current source. Future K/V scheduling work should require fresh simulator evidence for a
+    single family before adding another compile-time knob.
+- Reports:
+  - `evaluation_reports/codex_point11_family_kv_multibuffer_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point11_family_kv_multibuffer_performance/evaluation_report.json`
