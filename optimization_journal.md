@@ -2830,3 +2830,57 @@
 - Reports:
   - `evaluation_reports/codex_point11_kv_multibuffer_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point11_kv_multibuffer_performance/evaluation_report.json`
+
+## 2026-07-27 - Optimization point 5/6: final normalization reciprocal regression
+
+- Commit: journal-only commit for this entry; source was reverted after performance validation.
+- Optimization point: 5/6, scalar-to-vector / avoid scalar lowering, guided by IR evidence that several kernel families
+  lower the final normalization to `vdiv_2d_float`.
+- Motivation:
+  - Current IR dumps for the generic, hz-major, and parity families show the final output normalization source lines
+    lowering to two-dimensional vector division:
+    `accumulator = acc_ptr / l_i[:, None]` or `accumulator = accumulator / l_i[:, None]`.
+  - Profiles remain scalar/MTE/sync heavy instead of cleanly MMAD-bound, so reducing the final divide width looked like a
+    plausible low-risk vector-pipeline experiment.
+  - Hypothesis: computing a one-dimensional inverse once (`inv_l_i = 1.0 / l_i`) and broadcasting it through a
+    two-dimensional multiply could replace expensive 2D division with cheaper 1D division plus vector multiply.
+- Content:
+  - Temporarily changed all four final normalization sites:
+    - Generic UB accumulator path in `_attn_fwd_tile()`.
+    - Generic GM accumulator path in `_attn_fwd_tile()`.
+    - `_attn_fwd_causal_diag_split_tile()`.
+    - `_attn_fwd_causal_diag_split_parity_tile()`.
+  - The tested form was:
+    `inv_l_i = 1.0 / l_i` followed by `accumulator = accumulator * inv_l_i[:, None]`.
+  - Kept tiling, D128 hz-major routing, D128 2048 CV bundle, D256 parity routing, non-causal D256 mask-index elision,
+    no-LSE store/log elision, K/V load ordering, and `DEFAULT_PERSISTENT_PROGRAMS = 20` unchanged.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Checklist review: the change kept fp32 division, did not add int64 arithmetic, integer comparisons, modulo, extra grid
+    dimensions, interleaved task partitioning, mutable loop-index updates, `break`, or `continue`.
+  - Correctness suite: `18/18` passed in
+    `evaluation_reports/codex_point6_final_norm_recip_correctness/evaluation_report.json`.
+  - Performance suite: `6/6` matched in
+    `evaluation_reports/codex_point6_final_norm_recip_performance/evaluation_report.json`.
+  - Submit-style performance score regressed from the active best `22.506673665520136 / 60` to
+    `21.265195558395543 / 60`.
+  - Mean speedup regressed from `0.37511122775866895` to `0.35441992597325905`.
+  - Median speedup regressed from `0.367469250279431` to `0.34879281725977357`.
+  - Per-shape speedups after the experiment:
+    - `(128,8,1024,128, causal=True)`: `0.2860793263628685 -> 0.2713970849439511`.
+    - `(128,8,1024,256, causal=True)`: `0.2908101646927782 -> 0.27885819185240845`.
+    - `(128,8,2048,128, causal=True)`: `0.3271592699844636 -> 0.3114226991640886`.
+    - `(128,8,2048,256, causal=False)`: `0.4879122341826647 -> 0.45739854621089293`.
+    - `(128,8,4096,128, causal=False)`: `0.40777923057439847 -> 0.38616293535545854`.
+    - `(128,8,8192,64, causal=False)`: `0.4509271407548402 -> 0.42128009831275465`.
+- Issues:
+  - All six scored performance shapes slowed, so the backend likely already handles the broadcast denominator efficiently
+    enough, or the explicit inverse introduces an extra live vector / scheduling dependency that hurts the final store
+    pipeline.
+  - Treat final normalization reciprocal materialization as rejected for the current kernel families unless future IR
+    proves the multiply form removes `vdiv_2d_float` without increasing MTE/sync pressure.
+  - The temporary source change was reverted.
+- Reports:
+  - `evaluation_reports/codex_point6_final_norm_recip_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_point6_final_norm_recip_performance/evaluation_report.json`
