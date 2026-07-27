@@ -3101,3 +3101,38 @@
 - Reports:
   - `evaluation_reports/codex_point25_d128_2048_auto_cv_balance_correctness/evaluation_report.json`
   - `evaluation_reports/codex_point25_d128_2048_auto_cv_balance_performance/evaluation_report.json`
+
+## 2026-07-27 - Baseline correction: restore submitted best.py
+
+- Commit: this restore commit.
+- Optimization point: baseline correction / rollback to the externally confirmed best implementation, not a new latency
+  optimization point.
+- Motivation:
+  - Submission feedback showed that the later branch-heavy kernel-family changes were net negative under the real scoring
+    environment, and the actual highest-scoring implementation is `/workspace/best.py`.
+  - The local visible reports that treated the later `22.506673665520136 / 60` performance run as the active best were
+    therefore not authoritative for final submission ranking.
+- Content:
+  - Replaced `flash_attention_forward.py` with `/workspace/best.py`.
+  - Removed the later wide-lazy-GM, no-LSE elision, D128 hz-major, D256 diag-split/parity, and related compile-option
+    specialization branches from the active submission path.
+  - Kept all historical negative experiment reports and journal entries for auditability.
+- Effect:
+  - `python3 -m py_compile flash_attention_forward.py`: pass.
+  - `git diff --check`: pass.
+  - Restored file matches `/workspace/best.py` byte-for-byte after replacement.
+  - Local visible correctness suite: `18/18` passed in
+    `evaluation_reports/codex_restore_best_correctness/evaluation_report.json`.
+  - Local visible performance suite: `6/6` matched in
+    `evaluation_reports/codex_restore_best_performance/evaluation_report.json`.
+  - Local visible performance score for restored best: `20.15921242939593 / 60`, mean speedup
+    `0.33598687382326553`, median speedup `0.31676104089057266`.
+  - Combined local visible score by summing the separate correctness and performance runs: `60.15921242939593 / 100`.
+- Issues:
+  - The local visible evaluator and the submission environment/ranking can disagree enough that a locally positive
+    branch-family change may be a real submit-side regression.
+  - Future optimization must start from `/workspace/best.py` and require submit-side confirmation or a simulator/IR
+    explanation that predicts hidden-score behavior before replacing this baseline.
+- Reports:
+  - `evaluation_reports/codex_restore_best_correctness/evaluation_report.json`
+  - `evaluation_reports/codex_restore_best_performance/evaluation_report.json`
