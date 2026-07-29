@@ -678,7 +678,7 @@ def _attn_fwd_inner_loop(
         # Ascend compare paths are much more likely to stay vectorized with fp32 than int64/int32.
         offs_m_for_cmp = offs_m.to(tl.float32)
 
-    
+
     for start_n in tl.range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         curr_n = start_n + offs_n
@@ -688,7 +688,7 @@ def _attn_fwd_inner_loop(
         if NEED_CAUSAL_MASK:
             curr_n_for_cmp = curr_n.to(tl.float32)
 
-        qk = tl.dot(q, tl.trans(k), out_dtype=tl.float16)
+        qk = tl.dot(q, tl.trans(k), out_dtype=tl.float16).to(tl.float32)
         # qk = qk * qk_scale
 
         if NEED_CAUSAL_MASK:

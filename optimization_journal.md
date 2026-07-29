@@ -3136,3 +3136,64 @@
 - Reports:
   - `evaluation_reports/codex_restore_best_correctness/evaluation_report.json`
   - `evaluation_reports/codex_restore_best_performance/evaluation_report.json`
+
+## 2026-07-29 - QK score dot fp16 output
+
+- Commit: this change.
+- Optimization point: single `tl.dot` output dtype specialization for the QK score tile.
+- Motivation:
+  - In the restored best implementation, `qk = tl.dot(q, tl.trans(k))` produces fp32 score tiles. The score tile is
+    live across mask/softmax work and is a major L0C/UB pressure source.
+  - On Ascend910B3, `BM=128, BN=256` makes a fp32 QK tile occupy `128 * 256 * 4 = 128KB`, which is the full L0C size.
+    Reducing the QK result tile to fp16 can lower local buffer pressure and backend movement/synchronization overhead.
+  - A minimal local Triton probe confirmed that this environment accepts `tl.dot(..., out_dtype=tl.float16)` for fp16
+    inputs. The full attention evaluator still remains the precision gate.
+- Content:
+  - Changed the QK score computation from:
+    `qk = tl.dot(q, tl.trans(k))`
+    to:
+    `qk = tl.dot(q, tl.trans(k), out_dtype=tl.float16)`.
+  - Kept the rest of the softmax, causal mask, `USE_MAX`, `ACC_IN_UB`, tiling presets, persistent program count, and
+    launch parameters unchanged.
+  - Also tested a rejected alternative, `tl.dot(..., out_dtype=tl.float16).to(tl.float32)`, to separate the benefit of
+    lower QK storage from the cost of converting back before softmax.
+- Effect:
+  - `python3 -m py_compile experiment_fp16_qk/flash_attention_forward_qk_outfp16.py`: pass.
+  - Correctness suite for direct fp16 QK: `18/18` passed with default `atol=1e-2, rtol=1e-2`.
+  - Correctness suite for fp16 QK then fp32 cast: `18/18` passed with default `atol=1e-2, rtol=1e-2`.
+  - Performance baseline from the restored best in the same run:
+    score `20.426901932175475 / 60`, mean speedup `0.3404483655362579`.
+  - Direct fp16 QK performance:
+    score `21.86105447596346 / 60`, mean speedup `0.36435090793272434`, `6/6` output matched.
+  - fp16 QK then fp32 cast performance:
+    score `21.279758736702576 / 60`, mean speedup `0.35466264561170957`, `6/6` output matched.
+  - Post-merge validation on `flash_attention_forward.py`:
+    - `python3 -m py_compile flash_attention_forward.py`: pass.
+    - `git diff --check -- flash_attention_forward.py optimization_journal.md`: pass.
+    - correctness `18/18`, score `40.0 / 40`.
+    - performance `6/6` matched, score `20.99837996940402 / 60`, mean speedup `0.349972999490067`,
+      median speedup `0.32639736627856064`.
+  - Direct fp16 QK geometric mean latency improvement vs restored best across the six performance cases:
+    approximately `+6.78%`.
+  - Per-shape median latency change for direct fp16 QK:
+    - `(128,8,1024,128, causal=True)`: `11692.125us -> 10684.815us` (`-8.62%`).
+    - `(128,8,1024,256, causal=True)`: `17681.735us -> 17039.380us` (`-3.63%`).
+    - `(128,8,2048,128, causal=True)`: `37159.405us -> 35595.855us` (`-4.21%`).
+    - `(128,8,2048,256, causal=False)`: `71578.390us -> 64747.695us` (`-9.54%`).
+    - `(128,8,4096,128, causal=False)`: `169073.870us -> 158823.460us` (`-6.06%`).
+    - `(128,8,8192,64, causal=False)`: `585407.900us -> 550975.890us` (`-5.88%`).
+- Issues:
+  - The optimization intentionally lowers the QK logits tile from fp32 to fp16 before softmax, so it is a precision tradeoff
+    rather than a purely algebra-preserving backend hint.
+  - The default evaluator tolerance accepts the result. The largest observed performance-suite absolute difference for
+    direct fp16 QK was `0.0048828125`, below the `1e-2` absolute tolerance.
+  - Hidden or adversarial input distributions with larger logits could be more sensitive because the change affects the
+    softmax input, not only a final output cast.
+  - The `.to(tl.float32)` alternative was positive but weaker, so the direct fp16 QK path was selected.
+- Reports:
+  - `experiment_fp16_qk/reports_qk_outfp16_correctness/evaluation_report.json`
+  - `experiment_fp16_qk/reports_qk_outfp16_performance/evaluation_report.json`
+  - `experiment_fp16_qk/reports_qk_outfp16_to_fp32_correctness/evaluation_report.json`
+  - `experiment_fp16_qk/reports_qk_outfp16_to_fp32_performance/evaluation_report.json`
+  - `experiment_fp16_qk/reports_merged_qk_outfp16_correctness/evaluation_report.json`
+  - `experiment_fp16_qk/reports_merged_qk_outfp16_performance/evaluation_report.json`
