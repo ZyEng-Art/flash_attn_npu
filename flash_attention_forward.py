@@ -903,6 +903,7 @@ def _attn_fwd_tile(
     STAGE: tl.constexpr,
     ACC_IN_UB: tl.constexpr,
     USE_MAX: tl.constexpr,
+    STORE_LSE: tl.constexpr,
     linear_tile,
 ):
     # Tile-to-core decomposition depends on STAGE (compile-time constant), trading off
@@ -1019,7 +1020,8 @@ def _attn_fwd_tile(
             USE_MAX,
         )
 
-    m_i += tl.math.log(l_i)
+    if STORE_LSE:
+        m_i += tl.math.log(l_i)
     if ACC_IN_UB:
         accumulator = acc_ptr / l_i[:, None]
     else:
@@ -1028,8 +1030,9 @@ def _attn_fwd_tile(
         accumulator = tl.load(acc_ptr + row * HEAD_DIM + col_head_dim)
         accumulator = accumulator / l_i[:, None]
 
-    m_ptrs = M + task_hz_idx * N_CTX + offs_m
-    tl.store(m_ptrs, m_i.to(tl.float32))
+    if STORE_LSE:
+        m_ptrs = M + task_hz_idx * N_CTX + offs_m
+        tl.store(m_ptrs, m_i.to(tl.float32))
     tl.store(o_block_ptr, accumulator.to(Out.type.element_ty))
 
 
@@ -1067,6 +1070,7 @@ def _attn_fwd(
     STAGE: tl.constexpr,
     ACC_IN_UB: tl.constexpr,
     USE_MAX: tl.constexpr,
+    STORE_LSE: tl.constexpr,
 ):
     num_tiles_m = tl.cdiv(N_CTX, BLOCK_M)
     total_tiles = num_tiles_m * Z * H
@@ -1107,6 +1111,7 @@ def _attn_fwd(
             STAGE,
             ACC_IN_UB,
             USE_MAX,
+            STORE_LSE,
             linear_tile,
         )
 
@@ -1127,13 +1132,17 @@ def _build_grid(z, h, n_ctx, block_m):
     return (min(total_tiles, _get_persistent_programs()), 1, 1)
 
 
-def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None):
+def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None, return_lse=False):
     _validate_inputs(q, k, v)
 
     z, h, n_ctx, head_dim = q.shape
     bm, bn, _ = _resolve_tiling(z, h, n_ctx, head_dim, causal, bm, bn)
     out = torch.empty_like(q)
-    lse = torch.empty((z, h, n_ctx), device=q.device, dtype=torch.float32)
+    lse = (
+        torch.empty((z, h, n_ctx), device=q.device, dtype=torch.float32)
+        if return_lse
+        else torch.empty((1,), dtype=torch.float32, device=q.device)
+    )
     # Keep the fp32 accumulator in UB whenever (BLOCK_M x HEAD_DIM) fits, even for
     # HEAD_DIM==256. This avoids the per-KV-iteration GM round-trip + extract_slice
     # path, which is pure Vector/MTE overhead on the critical path.
@@ -1189,13 +1198,14 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None):
         STAGE=stage,
         ACC_IN_UB=acc_in_ub,
         USE_MAX=use_max,
+        STORE_LSE=return_lse,
         debug=False,
     )
     return out, lse
 
 
 def attention(q, k, v, causal, sm_scale, BM=None, BN=None, return_lse=False):
-    out, lse = _launch_kernel(q, k, v, causal, sm_scale, bm=BM, bn=BN)
+    out, lse = _launch_kernel(q, k, v, causal, sm_scale, bm=BM, bn=BN, return_lse=return_lse)
     if return_lse:
         return out, lse
     return out
