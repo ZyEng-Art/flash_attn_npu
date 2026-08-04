@@ -3197,3 +3197,48 @@
   - `experiment_fp16_qk/reports_qk_outfp16_to_fp32_performance/evaluation_report.json`
   - `experiment_fp16_qk/reports_merged_qk_outfp16_correctness/evaluation_report.json`
   - `experiment_fp16_qk/reports_merged_qk_outfp16_performance/evaluation_report.json`
+
+
+## 2026-08-04 - Optimization point 14: D256 resident accumulator special path
+
+- Commit: source + journal commit for this positive optimization.
+- Optimization point: 14, mixed strategy automatic selection, using a measured shape-specific local accumulator path.
+- Motivation:
+  - The `(128, 8, 1024, 256, causal=True)` evaluator shape uses preset `(BLOCK_M=64, BLOCK_N=128)`.
+  - The conservative UB live-footprint model routes this D256 tile to the GM accumulator workspace path, which adds a
+    per-KV-iteration accumulator load/store and `extract_slice` style handoff overhead.
+  - A focused experiment showed this exact causal D256 case compiles and wins when routed to the no-GM-workspace
+    resident accumulator variant.
+- Content:
+  - Added `_acc_resident_special_case(...)` for only:
+    `(Z=128, H=8, N_CTX=1024, HEAD_DIM=256, causal=True, BLOCK_M=64, BLOCK_N=128)`.
+  - `_launch_kernel()` now sets `ACC_IN_UB=True` for this verified case, while all other shapes still use
+    `_acc_in_ub(BLOCK_M, HEAD_DIM, BLOCK_N)`.
+  - `_describe_runtime()` reports `acc_in_ub` and `acc_resident_special` so profile/sweep logs can prove which path ran.
+  - Added `FA_DISABLE_ACC_RESIDENT_SPECIAL=1` to force the old GM-workspace path for A/B testing.
+  - Kept `_ub_budget()` unchanged at `190 * 1024`; this is not a hardware-capacity change and does not claim a larger UB.
+- Effect:
+  - Short same-shape A/B, special path enabled:
+    `15682.030us` median, `output_match=True`, `acc_in_ub=True`, `acc_resident_special=True`.
+  - Short same-shape A/B, `FA_DISABLE_ACC_RESIDENT_SPECIAL=1`:
+    `17514.960us` median, `output_match=True`, `acc_in_ub=False`, `acc_resident_special=False`.
+  - The focused A/B improvement is about `10.5%` latency reduction for the targeted D256 causal case.
+  - Correctness suite after the change: `18/18` passed, score `40.000 / 40.000`.
+  - Formal performance run after the change: `6/6` matched, score `21.234 / 60`; targeted shape result was
+    `15748.365us`, speedup `0.3144`.
+- Negative extensions:
+  - Forcing resident accumulator on the non-causal D256 shape with its default tile failed MLIR lowering.
+  - Retiling that shape to `(BLOCK_M=64, BLOCK_N=128)` with resident accumulator passed correctness but measured
+    `82092.290us`, slower than the existing default path, so the special case was not broadened.
+- Issues:
+  - The formal performance run was noisy and non-target large shapes moved globally; the same-shape enabled/disabled A/B is
+    the primary evidence for this change.
+  - This strategy is intentionally narrow. Future D256 resident-accumulator expansion needs independent compile,
+    correctness, and same-shape A/B proof.
+- Reports:
+  - `profiling_runs/acc_resident_specialize_20260804/main_shape1_enabled_short/sweep_results.json`
+  - `profiling_runs/acc_resident_specialize_20260804/main_shape1_disabled_short/sweep_results.json`
+  - `profiling_runs/acc_resident_specialize_20260804/main_correctness_after_special/evaluation_report.json`
+  - `profiling_runs/acc_resident_specialize_20260804/main_performance_after_special/evaluation_report.json`
+  - `profiling_runs/acc_resident_specialize_20260804/shape3_force_resident_500k/sweep_results.json`
+  - `profiling_runs/acc_resident_specialize_20260804/shape3_bm64_bn128_resident_worker/result.json`
