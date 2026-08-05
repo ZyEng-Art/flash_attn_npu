@@ -3453,3 +3453,95 @@
 - Reports:
   - `experiment_next_qk_all_fp16/reports_correctness/evaluation_report.json`
   - `experiment_next_qk_all_fp16/reports_performance_i80/evaluation_report.json`
+
+## 2026-08-05 - Optimization point 6/5/7: all-QK fp16 + int32 offsets + lazy m_i skip noise check
+
+- Commit: journal-only commit; rejected dirty composite candidate, no source merge.
+- Candidate source: transient dirty `/workspace/new_attn/flash_attention_forward.py` state from a concurrent old experiment.
+- Optimization points:
+  - 6, QK dot output dtype narrowing.
+  - 5/6, int64-to-int32 offset arithmetic reduction in scratch/GM offset formulas.
+  - 7, lazy path dead `m_i=-inf` initialization suppression when `STORE_LSE=False`.
+- Motivation:
+  - After the all-QK-fp16 standalone candidate improved only shape 5 but lost aggregate score, a dirty composite state appeared
+    that additionally changed scratch indexing and top-level offsets from int64 to int32 and skipped lazy `m_i` initialization.
+  - Because the dirty state had `18/18` correctness, it was treated as a candidate rather than merged blindly.
+- Validation:
+  - Correctness suite from the dirty state: `18/18` passed, score `40.000 / 40.000`.
+- Performance outcome:
+  - First run reported `31.077032 / 60`, but this was a false positive: shape 1 baseline median inflated to
+    `227710.360us`, while candidate median was `235357.320us` versus the accepted main-file median `9209.825us`.
+  - Repeat reported `38.132374 / 60`, but again score was baseline-contaminated: candidate median was worse than the accepted
+    main-file median on shapes 1, 3, 4, 5, and 6.
+  - Key repeat candidate medians vs accepted main:
+    - Shape 1: `9323.035us` vs `9209.825us`.
+    - Shape 4: `100827.940us` vs `61899.060us`.
+    - Shape 5: `217639.905us` vs `173872.530us`.
+    - Shape 6: `744280.605us` vs `422377.745us`.
+- Result:
+  - Rejected. The evaluator score was polluted by reference baseline spikes; candidate-side latency clearly regressed.
+  - Restored `flash_attention_forward.py` to the accepted pushed main-file version.
+- Reports:
+  - `evaluation_reports_correctness_int32_offsets_current/evaluation_report.json`
+  - `evaluation_reports_perf_int32_offsets_allqk_current_i80/evaluation_report.json`
+  - `evaluation_reports_perf_int32_offsets_allqk_current_i80_repeat/evaluation_report.json`
+
+## 2026-08-05 - Optimization point 7: lazy m_i initialization skip standalone experiment
+
+- Commit: journal-only commit; rejected candidate, no source merge.
+- Candidate source: transient main-file state containing only the lazy `m_i` initialization skip after restoring all-QK/int32
+  offset changes.
+- Optimization point: 7, pass elimination / dead vector initialization elimination.
+- Motivation:
+  - In lazy softmax mode with `STORE_LSE=False`, `m_i` is not used for online max tracking or final LSE storage.
+  - Hypothesis: avoid `tl.full((BLOCK_M,), -inf, tl.float32)` on the lazy evaluator path and initialize `m_i` only when
+    `USE_MAX=True` or `STORE_LSE=True`.
+- Validation:
+  - `python3 -m py_compile /workspace/new_attn/flash_attention_forward.py`: pass.
+  - `git diff --check -- flash_attention_forward.py`: pass.
+  - Correctness suite: `18/18` passed, score `40.000 / 40.000`.
+- Performance comparison, `--warmup 10 --iters 80 --speed-metric median_us`:
+  - Accepted main-file reference: `24.381032 / 60`, mean speedup `0.406351`, median speedup `0.349122`.
+  - Lazy-`m_i`-skip candidate: `24.712134 / 60`, mean speedup `0.411869`, median speedup `0.352759`.
+  - Despite the slightly higher score, candidate-side medians were worse on the first three shapes:
+    - Shape 1: `9209.825us -> 9303.355us` (`+1.02%`).
+    - Shape 2: `15661.600us -> 15989.940us` (`+2.10%`).
+    - Shape 3: `29668.320us -> 30135.280us` (`+1.57%`).
+  - Improvements on shape 4 (`-0.06%`) and shape 5 (`-1.32%`) were too small and mixed with baseline variation.
+- Result:
+  - Rejected as a score-noise false positive. Candidate-side latency does not justify merging.
+  - Restored `flash_attention_forward.py` to the accepted pushed main-file version.
+- Reports:
+  - `evaluation_reports_correctness_lazy_mi_skip_current/evaluation_report.json`
+  - `evaluation_reports_perf_lazy_mi_skip_current_i80/evaluation_report.json`
+
+## 2026-08-05 - Optimization point 6: int32 qvk/acc offset standalone experiment
+
+- Commit: journal-only commit; rejected candidate, no source merge.
+- Candidate source: transient main-file state with only two `_attn_fwd_tile()` offset casts changed.
+- Optimization point: 6, avoid scalar lowering from unnecessary int64 arithmetic.
+- Motivation:
+  - A dirty composite experiment included int32 offset casts. To isolate the effect, tested only:
+    `qvk_offset = off_z.to(tl.int32) * stride_qz + off_h.to(tl.int32) * stride_qh`
+    and the matching GM accumulator `acc_offset` expression.
+- Validation:
+  - `python3 -m py_compile /workspace/new_attn/flash_attention_forward.py`: pass.
+  - `git diff --check -- flash_attention_forward.py`: pass.
+  - Correctness suite: `18/18` passed, score `40.000 / 40.000`.
+- Performance comparison, `--warmup 10 --iters 80 --speed-metric median_us`:
+  - Accepted main-file reference: `24.381032 / 60`, mean speedup `0.406351`, median speedup `0.349122`.
+  - Standalone int32-offset candidate: `24.126779 / 60`, mean speedup `0.402113`, median speedup `0.353157`.
+  - Candidate-side median latency regressed on all six scored shapes:
+    - Shape 1: `9209.825us -> 9466.030us` (`+2.78%`).
+    - Shape 2: `15661.600us -> 16071.310us` (`+2.62%`).
+    - Shape 3: `29668.320us -> 30120.995us` (`+1.53%`).
+    - Shape 4: `61899.060us -> 66157.765us` (`+6.88%`).
+    - Shape 5: `173872.530us -> 179475.030us` (`+3.22%`).
+    - Shape 6: `422377.745us -> 443795.165us` (`+5.07%`).
+- Result:
+  - Rejected. Although int32 offset arithmetic is generally attractive for avoiding scalar lowering, this kernel's current
+    generated schedule slows down with the standalone change.
+  - Restored `flash_attention_forward.py` to the accepted pushed main-file version.
+- Reports:
+  - `evaluation_reports_correctness_int32_offsets_standalone/evaluation_report.json`
+  - `evaluation_reports_perf_int32_offsets_standalone_i80/evaluation_report.json`
