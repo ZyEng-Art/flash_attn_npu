@@ -3545,3 +3545,27 @@
 - Reports:
   - `evaluation_reports_correctness_int32_offsets_standalone/evaluation_report.json`
   - `evaluation_reports_perf_int32_offsets_standalone_i80/evaluation_report.json`
+
+## 2026-08-05 - Optimization point 18: case3 wide-BN preset recheck
+
+- Commit: none; rejected candidate, no source merge.
+- Candidate source: transient main-file state changing only the scored shape
+  `(Z=128,H=8,N_CTX=2048,HEAD_DIM=128,causal=True)` preset from `(BM=128,BN=64)` to `(BM=64,BN=256)`.
+- Optimization point: 18, kernel family / shape-specific tiling specialization.
+- Motivation:
+  - Historical best/reference files used the stable wide-BN path for this shape.
+  - The current dirty main-file route used the lazy explicit-QK-scratch path. The scored i30 run had a noisy case3 median
+    (`39409.625us`, candidate CV `0.2453`), so the wide-BN preset was rechecked as a narrow A/B.
+- Validation:
+  - Correctness suite: `18/18` passed, score `40.000 / 40.000`.
+- Performance comparison, `--warmup 5 --iters 30 --speed-metric median_us`:
+  - Current dirty main-file reference: `24.751697 / 60`, mean speedup `0.412528`.
+  - Wide-BN candidate: `24.352007 / 60`, mean speedup `0.405867`.
+  - Case3 candidate-side median improved slightly (`39409.625us -> 38360.420us`), but the total score fell and the result
+    did not clear the no-regression rule.
+- Result:
+  - Rejected. In the current code shape, restoring the historical wide-BN preset is not a reliable positive optimization.
+  - Reverted the preset back to `(BM=128,BN=64)` / lazy explicit-QK-scratch.
+- Reports:
+  - `evaluation_reports_case3_widebn_correctness_20260805/evaluation_report.json`
+  - `evaluation_reports_case3_widebn_performance_i30_20260805/evaluation_report.json`
