@@ -218,6 +218,21 @@ def _acc_resident_special_case(z, h, n_ctx, head_dim, causal, block_m, block_n):
     )
 
 
+def _lazy_gm_acc_special_case(z, h, n_ctx, head_dim, causal, block_m, block_n):
+    """Use lazy softmax with GM accumulator for the measured D64 long non-causal case."""
+    if os.environ.get("FA_DISABLE_LAZY_GM_ACC_SPECIAL") == "1":
+        return False
+    return (
+        not causal
+        and z == 128
+        and h == 8
+        and n_ctx == 8192
+        and head_dim == 64
+        and block_m == 128
+        and block_n == 256
+    )
+
+
 def _use_lazy(block_m, block_n, head_dim, causal):
     """Whether to use the lazy (non-stabilized) softmax for this tile.
 
@@ -225,10 +240,10 @@ def _use_lazy(block_m, block_n, head_dim, causal):
     running-max stabilization is unnecessary; dropping it removes the per-iteration
     max-reduce / alpha / acc-rescale -- the Vector-core bottleneck.
 
-    Empirically the lazy accumulate compiles only for BLOCK_N <= 128: at BLOCK_N=256
-    the qk tile plus the live accumulator overflow the 128KB cube L0C
-    (ConvertLinalgRToBinary error). So wide-BN tiles (the fast non-causal cases) stay
-    on the stable path; they are also the cases where the wide BLOCK_N already wins.
+    Empirically the lazy resident-accumulator path compiles only for BLOCK_N <= 128:
+    at BLOCK_N=256 the qk tile plus the live accumulator overflow the 128KB cube L0C
+    (ConvertLinalgRToBinary error). Wide-BN tiles therefore stay on the stable path
+    unless a measured shape-specific GM-accumulator override selects lazy safely.
     """
     return block_n <= 128
 
@@ -651,7 +666,14 @@ def _describe_runtime(z, h, n_ctx, head_dim, causal, bm=None, bn=None):
     total_tiles = triton.cdiv(n_ctx, block_m) * z * h
     launched_programs = min(total_tiles, _get_persistent_programs())
     acc_resident_special = _acc_resident_special_case(z, h, n_ctx, head_dim, causal, block_m, block_n)
-    acc_in_ub = _acc_in_ub(block_m, head_dim, block_n) or acc_resident_special
+    lazy_gm_acc_special = _lazy_gm_acc_special_case(z, h, n_ctx, head_dim, causal, block_m, block_n)
+    acc_in_ub = False if lazy_gm_acc_special else (
+        _acc_in_ub(block_m, head_dim, block_n) or acc_resident_special
+    )
+    forced = os.environ.get("FA_USE_MAX")
+    use_max = (forced == "1") if forced is not None else (
+        False if lazy_gm_acc_special else not _use_lazy(block_m, block_n, head_dim, causal)
+    )
     return {
         "selected_config": {"BLOCK_M": block_m, "BLOCK_N": block_n},
         "tiling_source": tiling_source,
@@ -660,6 +682,8 @@ def _describe_runtime(z, h, n_ctx, head_dim, causal, bm=None, bn=None):
         "stage": 3 if causal else 1,
         "acc_in_ub": acc_in_ub,
         "acc_resident_special": acc_resident_special,
+        "lazy_gm_acc_special": lazy_gm_acc_special,
+        "use_max": use_max,
     }
 
 
@@ -705,7 +729,10 @@ def _attn_fwd_inner_loop_lazy_pair_pipeline(
         v0 = tl.load(v_block_ptr)
         if NEED_CAUSAL_MASK:
             curr_n0_for_cmp = curr_n0.to(tl.float32)
-        qk0 = tl.dot(q, tl.trans(k0), out_dtype=tl.float16)
+        if NEED_CAUSAL_MASK or HEAD_DIM != 128:
+            qk0 = tl.dot(q, tl.trans(k0), out_dtype=tl.float16)
+        else:
+            qk0 = tl.dot(q, tl.trans(k0))
         if NEED_CAUSAL_MASK:
             causal_mask0 = offs_m_for_cmp[:, None] >= curr_n0_for_cmp[None, :]
             qk0 = tl.where(causal_mask0, qk0, -1.0e6)
@@ -717,7 +744,10 @@ def _attn_fwd_inner_loop_lazy_pair_pipeline(
         v1 = tl.load(v1_ptr)
         if NEED_CAUSAL_MASK:
             curr_n1_for_cmp = curr_n1.to(tl.float32)
-        qk1 = tl.dot(q, tl.trans(k1), out_dtype=tl.float16)
+        if NEED_CAUSAL_MASK or HEAD_DIM != 128:
+            qk1 = tl.dot(q, tl.trans(k1), out_dtype=tl.float16)
+        else:
+            qk1 = tl.dot(q, tl.trans(k1))
         if NEED_CAUSAL_MASK:
             causal_mask1 = offs_m_for_cmp[:, None] >= curr_n1_for_cmp[None, :]
             qk1 = tl.where(causal_mask1, qk1, -1.0e6)
@@ -775,7 +805,10 @@ def _attn_fwd_inner_loop_lazy_kv_prefetch_pipeline(
         v0 = tl.load(v_block_ptr)
         if NEED_CAUSAL_MASK:
             curr_n0_for_cmp = curr_n0.to(tl.float32)
-        qk0 = tl.dot(q, tl.trans(k0), out_dtype=tl.float16)
+        if NEED_CAUSAL_MASK or HEAD_DIM != 128:
+            qk0 = tl.dot(q, tl.trans(k0), out_dtype=tl.float16)
+        else:
+            qk0 = tl.dot(q, tl.trans(k0))
         if NEED_CAUSAL_MASK:
             causal_mask0 = offs_m_for_cmp[:, None] >= curr_n0_for_cmp[None, :]
             qk0 = tl.where(causal_mask0, qk0, -1.0e6)
@@ -792,7 +825,10 @@ def _attn_fwd_inner_loop_lazy_kv_prefetch_pipeline(
 
         if NEED_CAUSAL_MASK:
             curr_n1_for_cmp = curr_n1.to(tl.float32)
-        qk1 = tl.dot(q, tl.trans(k1), out_dtype=tl.float16)
+        if NEED_CAUSAL_MASK or HEAD_DIM != 128:
+            qk1 = tl.dot(q, tl.trans(k1), out_dtype=tl.float16)
+        else:
+            qk1 = tl.dot(q, tl.trans(k1))
         if NEED_CAUSAL_MASK:
             causal_mask1 = offs_m_for_cmp[:, None] >= curr_n1_for_cmp[None, :]
             qk1 = tl.where(causal_mask1, qk1, -1.0e6)
@@ -849,23 +885,29 @@ def _attn_fwd_inner_loop_explicit_qk_scratch_pipeline(
 
         k0 = tl.load(k_block_ptr)
         v0 = tl.load(v_block_ptr)
-        qk0 = tl.dot(q, tl.trans(k0), out_dtype=tl.float16)
+        if NEED_CAUSAL_MASK or HEAD_DIM != 128:
+            qk0 = tl.dot(q, tl.trans(k0), out_dtype=tl.float16)
+        else:
+            qk0 = tl.dot(q, tl.trans(k0))
         tl.store(scratch_qk + slot0, qk0)
 
         k1_ptr = tl.advance(k_block_ptr, (BLOCK_N, 0))
         v1_ptr = tl.advance(v_block_ptr, (BLOCK_N, 0))
         k1 = tl.load(k1_ptr)
         v1 = tl.load(v1_ptr)
-        qk1 = tl.dot(q, tl.trans(k1), out_dtype=tl.float16)
+        if NEED_CAUSAL_MASK or HEAD_DIM != 128:
+            qk1 = tl.dot(q, tl.trans(k1), out_dtype=tl.float16)
+        else:
+            qk1 = tl.dot(q, tl.trans(k1))
         tl.store(scratch_qk + slot1, qk1)
 
         qk0_reloaded = tl.load(scratch_qk + slot0)
         p0 = tl.math.exp(qk0_reloaded)
-        l_i += tl.sum(p0, axis=1)
-        acc_ptr = tl.dot(p0.to(k0.dtype), v0, acc_ptr)
 
         qk1_reloaded = tl.load(scratch_qk + slot1)
         p1 = tl.math.exp(qk1_reloaded)
+        l_i += tl.sum(p0, axis=1)
+        acc_ptr = tl.dot(p0.to(k0.dtype), v0, acc_ptr)
         l_i += tl.sum(p1, axis=1)
         acc_ptr = tl.dot(p1.to(k1.dtype), v1, acc_ptr)
 
@@ -1003,7 +1045,10 @@ def _attn_fwd_inner_loop(
         if NEED_CAUSAL_MASK:
             curr_n_for_cmp = curr_n.to(tl.float32)
 
-        qk = tl.dot(q, tl.trans(k), out_dtype=tl.float16)
+        if NEED_CAUSAL_MASK or HEAD_DIM != 128:
+            qk = tl.dot(q, tl.trans(k), out_dtype=tl.float16)
+        else:
+            qk = tl.dot(q, tl.trans(k))
         # qk = qk * qk_scale
 
         if NEED_CAUSAL_MASK:
@@ -1025,7 +1070,7 @@ def _attn_fwd_inner_loop(
                 acc_ptr = acc_ptr * alpha[:, None]
                 acc_ptr = tl.dot(p_cast, v, acc_ptr)
             else:
-                pv = tl.dot(p_cast, v)
+                pv = tl.dot(p_cast, v, out_dtype=tl.float16)
                 acc = tl.load(acc_ptr + block2d_acc)
                 for slice_idx in range(4):
                     offset = slice_idx * (BLOCK_M // 4)
@@ -1061,7 +1106,7 @@ def _attn_fwd_inner_loop(
                 else:
                     acc_ptr = acc_ptr + tl.dot(p_cast, v)
             else:
-                pv = tl.dot(p_cast, v)
+                pv = tl.dot(p_cast, v, out_dtype=tl.float16)
                 acc = tl.load(acc_ptr + block2d_acc)
                 acc = acc + pv
                 tl.store(acc_ptr + block2d_acc, acc)
@@ -1498,8 +1543,12 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None, return_lse=False
     # fits. A separately measured d256 causal evaluator case also compiles and wins
     # with this resident accumulator path; that special case does not change the UB
     # capacity model, it only selects the no-GM-workspace kernel variant.
-    acc_in_ub = _acc_in_ub(bm, head_dim, bn) or _acc_resident_special_case(
+    acc_resident_special = _acc_resident_special_case(
         z, h, n_ctx, head_dim, causal, bm, bn
+    )
+    lazy_gm_acc_special = _lazy_gm_acc_special_case(z, h, n_ctx, head_dim, causal, bm, bn)
+    acc_in_ub = False if lazy_gm_acc_special else (
+        _acc_in_ub(bm, head_dim, bn) or acc_resident_special
     )
     acc = (
         torch.empty((1,), dtype=torch.float32, device=q.device)
@@ -1517,7 +1566,7 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None, return_lse=False
     if forced is not None:
         use_max = forced == "1"
     else:
-        use_max = not _use_lazy(bm, bn, head_dim, causal)
+        use_max = False if lazy_gm_acc_special else not _use_lazy(bm, bn, head_dim, causal)
     can_pipeline_lazy = (
         causal
         and not use_max

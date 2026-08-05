@@ -3198,6 +3198,58 @@
   - `experiment_fp16_qk/reports_merged_qk_outfp16_correctness/evaluation_report.json`
   - `experiment_fp16_qk/reports_merged_qk_outfp16_performance/evaluation_report.json`
 
+## 2026-07-29 - P@V temporary dot fp16 output experiment
+
+- Commit: not merged in this entry; experiment-only until submit-side risk is accepted.
+- Optimization point: single `tl.dot` output dtype specialization for the non-fused `p @ v` temporary tile.
+- Motivation:
+  - After the QK score tile was lowered to fp16, the remaining large fp32 tiles on the data path are the accumulator and
+    the temporary `pv = p @ v` result in `ACC_IN_UB=False` paths.
+  - The accumulator must stay fp32 for correctness and compiler support, but the temporary `pv` tile can be narrowed before
+    it is added into the fp32 accumulator.
+- Content:
+  - Tested viable low-risk candidate:
+    `pv = tl.dot(p_cast, v, out_dtype=tl.float16)` in both non-fused stable and lazy paths.
+  - Tested rejected fused-dot candidate:
+    `acc_ptr = tl.dot(p_cast, v, acc_ptr, out_dtype=tl.float16)` at all fused accumulator sites.
+  - Tested rejected accumulator-storage candidate:
+    `acc_ptr = tl.zeros(..., dtype=tl.float16)` and fp16 GM accumulator workspace.
+- Effect:
+  - `python3 -m py_compile experiment_acc_dtype/flash_attention_forward_pv_outfp16.py`: pass.
+  - `git diff --check -- experiment_acc_dtype/flash_attention_forward_pv_outfp16.py`: pass.
+  - `pv_outfp16` correctness: `18/18`, score `40.0 / 40`.
+  - `pv_outfp16` performance run 1: `6/6` matched, score `21.528571214214992 / 60`, mean speedup
+    `0.35880952023691653`, median speedup `0.33053903384599453`.
+  - `pv_outfp16` performance repeat: `6/6` matched, score `21.232074368770526 / 60`, mean speedup
+    `0.3538679061461754`.
+  - Repeated main-file baseline in the same phase: `6/6` matched, score `20.92924346921957 / 60`, mean speedup
+    `0.34882072448699286`.
+  - Repeat per-shape median latency vs repeated main-file baseline:
+    - `(128,8,1024,128, causal=True)`: `10888.100us -> 10917.410us` (`+0.27%`).
+    - `(128,8,1024,256, causal=True)`: `17813.625us -> 17505.555us` (`-1.73%`).
+    - `(128,8,2048,128, causal=True)`: `36885.080us -> 36915.675us` (`+0.08%`).
+    - `(128,8,2048,256, causal=False)`: `69646.225us -> 66297.360us` (`-4.81%`).
+    - `(128,8,4096,128, causal=False)`: `166210.465us -> 166137.535us` (`-0.04%`).
+    - `(128,8,8192,64, causal=False)`: `573909.481us -> 573890.955us` (`-0.00%`).
+  - Repeat geometric mean latency improvement vs repeated main-file baseline: about `+1.06%`.
+- Issues:
+  - Benefit is narrow and mainly comes from the D256 `ACC_IN_UB=False` paths. Other shapes are neutral or tiny noise-level
+    regressions.
+  - The all-`p@v` fp16-output candidate failed compile for all correctness cases with
+    `CompilationError(... AssertionError())`; the current backend does not accept direct `out_dtype=tl.float16` on the
+    fused accumulator `tl.dot(p_cast, v, acc_ptr)` path.
+  - The true fp16 accumulator-storage candidate also failed compile for all correctness cases with
+    `CompilationError(... AssertionError())`; keeping `acc_ptr` fp32 is required by the current compiler path.
+  - Because previous qk-only reports showed noticeable run-to-run timing drift, this candidate should be submit-tested
+    before replacing the current pushed main file.
+- Reports:
+  - `experiment_acc_dtype/README.md`
+  - `experiment_acc_dtype/reports_pv_outfp16_correctness/evaluation_report.json`
+  - `experiment_acc_dtype/reports_pv_outfp16_performance/evaluation_report.json`
+  - `experiment_acc_dtype/reports_pv_outfp16_performance_repeat/evaluation_report.json`
+  - `experiment_acc_dtype/reports_main_qk_outfp16_performance_repeat/evaluation_report.json`
+  - `experiment_acc_dtype/reports_all_pv_outfp16_correctness/evaluation_report.json`
+  - `experiment_acc_dtype/reports_acc_fp16_correctness/evaluation_report.json`
 
 ## 2026-08-04 - Optimization point 14: D256 resident accumulator special path
 
@@ -3242,3 +3294,123 @@
   - `profiling_runs/acc_resident_specialize_20260804/main_performance_after_special/evaluation_report.json`
   - `profiling_runs/acc_resident_specialize_20260804/shape3_force_resident_500k/sweep_results.json`
   - `profiling_runs/acc_resident_specialize_20260804/shape3_bm64_bn128_resident_worker/result.json`
+
+## 2026-08-05 - Clean best follow-up: single-point dtype/path probes
+
+- Baseline for this batch:
+  - `/workspace/best.py` same-window performance recheck: `20.434107 / 60`, mean speedup `0.340568`, median `0.325870`.
+  - All candidates below were compared against this same-window reference and validated with the real evaluator.
+
+### QK score dot fp16 output
+
+- Candidate: `experiment_clean_best/candidate_best_qk_fp16.py`
+- Change: `qk = tl.dot(q, tl.trans(k), out_dtype=tl.float16)`; no other kernel/path change.
+- Correctness: `18/18` passed.
+- Performance: `20.746442 / 60`, mean speedup `0.345774`, median `0.319188`.
+- Result:
+  - Small positive move over same-window best (`+0.312335 / 60`).
+  - Candidate latency improved on the first four scored cases, but the last two cases did not create a large enough aggregate gain to beat later PV work.
+  - Keep as a valid localized positive probe; not merged yet because later single-point probes dominate it.
+
+### D256 resident accumulator special case
+
+- Candidate: `experiment_clean_best/candidate_best_d256_resident.py`
+- Change: narrow `ACC_IN_UB=True` routing to the measured D256 causal shape `(128, 8, 1024, 256, causal=True, BM=64, BN=128)` and expose the runtime flags in `_describe_runtime()`.
+- Correctness: `18/18` passed.
+- Performance: `20.307097 / 60`, mean speedup `0.338452`, median `0.319110`.
+- Result:
+  - Negative versus same-window best (`-0.127010 / 60`).
+  - Target D256 causal case latency itself improved locally, but the aggregate score did not hold up.
+  - Rejected as a standalone patch.
+
+### Non-fused PV dot fp16 output
+
+- Candidate: `experiment_clean_best/candidate_best_pv_outfp16.py`
+- Change: in both non-fused branches, `pv = tl.dot(p_cast, v, out_dtype=tl.float16)`.
+- Correctness: `18/18` passed.
+- Performance: `28.623956 / 60`, mean speedup `0.527077`, median `0.405629`.
+- Result:
+  - Best candidate in this batch by a wide margin.
+  - The first performance case showed a large improvement and the aggregate score rose sharply, but the candidate still shows high CV on the first two cases. Treat as promising but still worth one more same-window sanity check before merge.
+
+### Composed probes
+
+- Candidate: `experiment_clean_best/candidate_best_qk_pv_fp16.py`
+- Change: combine QK fp16 + non-fused PV fp16.
+- Correctness: `18/18` passed.
+- Performance: `21.902079 / 60`, mean speedup `0.365035`, median `0.331059`.
+- Result:
+  - Worse than PV-only. QK fp16 appears to eat into the PV-only gain when both are enabled together.
+  - Not merged.
+
+- Candidate: `experiment_clean_best/candidate_best_pv_d256_resident.py`
+- Change: combine PV fp16 + narrow D256 resident accumulator case.
+- Correctness: `18/18` passed.
+- Performance: `20.358 / 60`, mean speedup `0.3393`.
+- Result:
+  - Worse than PV-only. The narrow D256 resident case did not compose well with the PV fp16 path.
+  - Not merged.
+
+### Current conclusion
+
+- Best local probe in this batch: `candidate_best_pv_outfp16.py`.
+- Safest standalone positive probe: `candidate_best_qk_fp16.py`.
+- Standalone negative probes: `candidate_best_d256_resident.py`, `candidate_best_qk_pv_fp16.py`, `candidate_best_pv_d256_resident.py`.
+- Next step should be either:
+  - re-run the PV-only candidate once more to reduce noise, or
+  - profile why the PV fp16 path has high CV on the first two shapes before merging.
+
+## 2026-08-05 - Optimization point 14/11/6: composite main-file merge validation
+
+- Commit: source + journal commit for the verified composite version.
+- Optimization points:
+  - 14, mixed strategy / shape-specialized dispatch.
+  - 11, inner-loop load/compute schedule reshaping for the lazy head128 path.
+  - 6, dot output dtype narrowing where the compiler accepts it without breaking correctness.
+- Motivation:
+  - Single-point probes showed several individually useful but noisy directions: QK score dtype specialization, non-fused
+    `p @ v` fp16 output, D256 resident accumulator, and lazy-softmax pipeline reshaping.
+  - The submit reference `/workspace/best.py` remained the practical baseline after the earlier negative experiments, so the
+    final merge candidate needed a same-window recheck against that file rather than relying on stale reports.
+- Content merged into `/workspace/new_attn/flash_attention_forward.py`:
+  - Retiled the scored causal head128 long case `(128, 8, 2048, 128, causal=True)` from `(BM=64, BN=256)` stable/wide-BN to
+    `(BM=128, BN=64)` lazy with the explicit QK scratch pipeline.
+  - Added lazy pipeline helper paths for `BM=128, BN=64, HEAD_DIM=128`, including a two-block QK producer/consumer schedule
+    and an explicit-QK-scratch variant.
+  - Added narrow runtime switches:
+    `_acc_resident_special_case(...)` for the measured causal D256 shape and `_lazy_gm_acc_special_case(...)` for the
+    measured non-causal D64 long shape.
+  - Kept `qk = tl.dot(q, tl.trans(k))` fp32-output only for non-causal `HEAD_DIM == 128`; used
+    `out_dtype=tl.float16` for causal QK and non-head128 QK paths.
+  - Used `pv = tl.dot(p_cast, v, out_dtype=tl.float16)` only in the non-fused GM-accumulator branches. Fused
+    `tl.dot(p_cast, v, acc_ptr)` paths remain unchanged because the backend rejected direct fp16 output there.
+- Validation:
+  - `python3 -m py_compile /workspace/new_attn/flash_attention_forward.py`: pass.
+  - `git diff --check -- flash_attention_forward.py`: pass.
+  - Correctness suite: `18/18` passed, score `40.000 / 40.000`.
+- Same-window performance, `--warmup 10 --iters 80 --speed-metric median_us`:
+  - Current main file: `24.381032 / 60`, mean speedup `0.406351`, median speedup `0.349122`.
+  - `/workspace/best.py`: `20.023576 / 60`, mean speedup `0.333726`, median speedup `0.313960`.
+  - Local combined score using the separate correctness + performance runs: `64.381032 / 100`.
+  - Performance-score improvement over `/workspace/best.py`: `+4.357456 / 60`.
+- Per-shape median candidate latency vs `/workspace/best.py`:
+  - `(128,8,1024,128, causal=True)`: `11746.960us -> 9209.825us` (`-21.60%`).
+  - `(128,8,1024,256, causal=True)`: `18146.015us -> 15661.600us` (`-13.69%`).
+  - `(128,8,2048,128, causal=True)`: `37592.230us -> 29668.320us` (`-21.08%`).
+  - `(128,8,2048,256, causal=False)`: `74471.590us -> 61899.060us` (`-16.88%`).
+  - `(128,8,4096,128, causal=False)`: `173428.060us -> 173872.530us` (`+0.26%`, small regression).
+  - `(128,8,8192,64, causal=False)`: `589404.055us -> 422377.745us` (`-28.34%`).
+- Issues:
+  - Shape 5 regresses slightly in this same-window run; the composite still wins strongly on the aggregate score because the
+    other five scored shapes improve.
+  - PV-only once reported a higher one-off score, but repeated checks showed high jitter. This composite version is the
+    current accepted main-file candidate because it passed correctness and beat `/workspace/best.py` in the high-iteration
+    same-window run.
+  - The fp32 accumulator is intentionally preserved. Attempts to make fused `p @ v` or accumulator storage true fp16 failed
+    compiler lowering or correctness checks in prior experiments.
+  - These are evaluator-shape-specialized paths. Any future shape expansion needs a fresh compile/correctness/performance
+    sweep before generalizing the dispatch rules.
+- Reports:
+  - `evaluation_reports_candidate_qk_mixed_correctness/evaluation_report.json`
+  - `evaluation_reports_candidate_qk_mixed_performance_i80/evaluation_report.json`
+  - `evaluation_reports_best_performance_i80/evaluation_report.json`
