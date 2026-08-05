@@ -3414,3 +3414,42 @@
   - `evaluation_reports_candidate_qk_mixed_correctness/evaluation_report.json`
   - `evaluation_reports_candidate_qk_mixed_performance_i80/evaluation_report.json`
   - `evaluation_reports_best_performance_i80/evaluation_report.json`
+
+## 2026-08-05 - Optimization point 6: all-QK fp16 output experiment
+
+- Commit: journal-only commit; rejected candidate, no source merge.
+- Candidate: `experiment_next_qk_all_fp16/candidate_all_qk_fp16.py`.
+- Optimization point: 6, dot output dtype narrowing.
+- Motivation:
+  - The composite main-file version keeps QK dot output as fp32 only for non-causal `HEAD_DIM == 128`.
+  - Same-window comparison showed the current main file regresses slightly on performance shape 5
+    `(128,8,4096,128, causal=False)`, which is exactly the non-causal head128 path.
+  - Hypothesis: making QK fp16 for that remaining path might remove the shape-5 regression without hurting the aggregate.
+- Content:
+  - In the candidate file only, replaced all remaining conditional QK output branches with fixed
+    `tl.dot(q, tl.trans(k*), out_dtype=tl.float16)`.
+  - Left `p @ v`, accumulator residency, tiling presets, lazy-GM special case, and pipeline paths unchanged.
+- Validation:
+  - `python3 -m py_compile experiment_next_qk_all_fp16/candidate_all_qk_fp16.py`: pass.
+  - `git diff --check -- experiment_next_qk_all_fp16/candidate_all_qk_fp16.py`: pass.
+  - Correctness suite: `18/18` passed, score `40.000 / 40.000`.
+- Same-window performance comparison, `--warmup 10 --iters 80 --speed-metric median_us`:
+  - Current main file: `24.381032 / 60`, mean speedup `0.406351`, median speedup `0.349122`.
+  - All-QK-fp16 candidate: `23.855981 / 60`, mean speedup `0.397600`, median speedup `0.356026`.
+  - Result: negative aggregate (`-0.525051 / 60`), rejected.
+- Per-shape median candidate latency vs current main:
+  - `(128,8,1024,128, causal=True)`: `9209.825us -> 9326.545us` (`+1.27%`).
+  - `(128,8,1024,256, causal=True)`: `15661.600us -> 15889.885us` (`+1.46%`).
+  - `(128,8,2048,128, causal=True)`: `29668.320us -> 29879.230us` (`+0.71%`).
+  - `(128,8,2048,256, causal=False)`: `61899.060us -> 66168.130us` (`+6.90%`).
+  - `(128,8,4096,128, causal=False)`: `173872.530us -> 166668.140us` (`-4.14%`, target shape improved).
+  - `(128,8,8192,64, causal=False)`: `422377.745us -> 441199.150us` (`+4.46%`).
+- Issues:
+  - The target non-causal head128 shape improves, but the D256 non-causal and long D64 non-causal shapes regress enough to
+    lose on the score.
+  - This confirms that the current mixed QK policy is better than an all-fp16 QK policy for the aggregate evaluator.
+  - Future work, if shape 5 becomes important, should use a separate shape-specific kernel family instead of globally
+    narrowing all QK paths.
+- Reports:
+  - `experiment_next_qk_all_fp16/reports_correctness/evaluation_report.json`
+  - `experiment_next_qk_all_fp16/reports_performance_i80/evaluation_report.json`
