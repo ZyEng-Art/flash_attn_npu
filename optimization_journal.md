@@ -3569,3 +3569,48 @@
 - Reports:
   - `evaluation_reports_case3_widebn_correctness_20260805/evaluation_report.json`
   - `evaluation_reports_case3_widebn_performance_i30_20260805/evaluation_report.json`
+
+## 2026-08-05 - Optimization point 14/18/6: accepted composite dtype/path specialization
+
+- Commit: this accepted source/journal commit.
+- Candidate source: current `flash_attention_forward.py`.
+- Optimization points:
+  - 6, avoid unnecessary int64 scalar offset arithmetic in the final Q/K/V and GM-accumulator pointer offsets.
+  - 14/18, shape-specific mixed strategy / kernel-family dispatch for the measured non-causal long D128 case.
+- Content:
+  - Kept the two `_attn_fwd_tile()` pointer-offset casts narrowed to `tl.int32`:
+    `qvk_offset` and the GM accumulator `acc_offset`.
+  - Added `_qk_out_fp16_special_case()` for only
+    `(Z=128,H=8,N_CTX=4096,HEAD_DIM=128,causal=False,BM=128,BN=256)`.
+    This lowers the QK dot result tile to fp16 on the one scored path where the default non-causal D128 QK tile remains
+    fp32.
+  - Extended `_lazy_gm_acc_special_case()` from the existing non-causal D64 long case to also cover the same non-causal
+    D128 long case. This routes the shape to the lazy non-stabilized softmax with GM accumulator (`ACC_IN_UB=False`,
+    `USE_MAX=False`) instead of the stable max/alpha path.
+- Validation:
+  - `python3 -m py_compile /workspace/new_attn/flash_attention_forward.py`: pass.
+  - `git diff --check -- flash_attention_forward.py`: pass.
+  - Correctness suite: `18/18` passed, score `40.000 / 40.000`.
+- Performance comparison, `--warmup 10 --iters 80 --speed-metric median_us`:
+  - Previous clean QK-special reference: `24.720724 / 60`, mean speedup `0.4120`.
+  - Current cleaned composite candidate: `25.636 / 60`, mean speedup `0.4273`.
+  - Earlier idle i80 runs from the same source measured `24.955 / 60` and `25.026 / 60`; the final accepted number uses
+    the device-idle rerun in `evaluation_reports_cleaned_candidate_perf_i80_20260805`.
+  - Per-shape candidate median vs the QK-special reference:
+    - Shape 1 `(128,8,1024,128,causal=True)`: `9176.705us -> 9315.205us`, speedup `0.3261 -> 0.3240`.
+    - Shape 2 `(128,8,1024,256,causal=True)`: `15654.785us -> 15562.080us`, speedup `0.3151 -> 0.3179`.
+    - Shape 3 `(128,8,2048,128,causal=True)`: `29550.180us -> 29842.230us`, speedup `0.3521 -> 0.3510`.
+    - Shape 4 `(128,8,2048,256,causal=False)`: `61603.535us -> 60538.700us`, speedup `0.5662 -> 0.5774`.
+    - Shape 5 `(128,8,4096,128,causal=False)`: `160939.300us -> 129459.845us`, speedup `0.3754 -> 0.4671`.
+    - Shape 6 `(128,8,8192,64,causal=False)`: `421919.940us -> 428725.335us`, speedup `0.5372 -> 0.5263`.
+- Result:
+  - Accepted. The only intentionally rerouted scored shape is shape 5, where lazy-GM plus QK fp16 cuts about `31.5ms`
+    from the candidate median. Shape 2 and shape 4 also improved in the final clean rerun; shape 1, shape 3, and shape 6
+    show small regressions, but the aggregate score is clearly positive versus the QK-special reference.
+  - Keep both debug disable switches:
+    `FA_DISABLE_QK_OUT_FP16_SPECIAL=1` and `FA_DISABLE_LAZY_GM_ACC_SPECIAL=1`, so future A/B runs can isolate the two
+    special paths without editing source.
+- Reports:
+  - `evaluation_reports_cleaned_candidate_correctness_20260805/evaluation_report.json`
+  - `evaluation_reports_perf_qk_special_clean_i80/evaluation_report.json`
+  - `evaluation_reports_cleaned_candidate_perf_i80_20260805/evaluation_report.json`

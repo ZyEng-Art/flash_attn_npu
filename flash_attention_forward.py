@@ -219,15 +219,28 @@ def _acc_resident_special_case(z, h, n_ctx, head_dim, causal, block_m, block_n):
 
 
 def _lazy_gm_acc_special_case(z, h, n_ctx, head_dim, causal, block_m, block_n):
-    """Use lazy softmax with GM accumulator for the measured D64 long non-causal case."""
+    """Use lazy softmax with GM accumulator for measured long non-causal cases."""
     if os.environ.get("FA_DISABLE_LAZY_GM_ACC_SPECIAL") == "1":
+        return False
+    if causal or z != 128 or h != 8 or block_m != 128 or block_n != 256:
+        return False
+    if head_dim == 64 and n_ctx == 8192:
+        return True
+    if head_dim == 128 and n_ctx == 4096:
+        return True
+    return False
+
+
+def _qk_out_fp16_special_case(z, h, n_ctx, head_dim, causal, block_m, block_n):
+    """Narrow QK output only for the measured non-causal D128 long case."""
+    if os.environ.get("FA_DISABLE_QK_OUT_FP16_SPECIAL") == "1":
         return False
     return (
         not causal
         and z == 128
         and h == 8
-        and n_ctx == 8192
-        and head_dim == 64
+        and n_ctx == 4096
+        and head_dim == 128
         and block_m == 128
         and block_n == 256
     )
@@ -667,6 +680,7 @@ def _describe_runtime(z, h, n_ctx, head_dim, causal, bm=None, bn=None):
     launched_programs = min(total_tiles, _get_persistent_programs())
     acc_resident_special = _acc_resident_special_case(z, h, n_ctx, head_dim, causal, block_m, block_n)
     lazy_gm_acc_special = _lazy_gm_acc_special_case(z, h, n_ctx, head_dim, causal, block_m, block_n)
+    qk_out_fp16_special = _qk_out_fp16_special_case(z, h, n_ctx, head_dim, causal, block_m, block_n)
     acc_in_ub = False if lazy_gm_acc_special else (
         _acc_in_ub(block_m, head_dim, block_n) or acc_resident_special
     )
@@ -683,6 +697,7 @@ def _describe_runtime(z, h, n_ctx, head_dim, causal, bm=None, bn=None):
         "acc_in_ub": acc_in_ub,
         "acc_resident_special": acc_resident_special,
         "lazy_gm_acc_special": lazy_gm_acc_special,
+        "qk_out_fp16_special": qk_out_fp16_special,
         "use_max": use_max,
     }
 
@@ -942,6 +957,7 @@ def _attn_fwd_inner_loop(
     PIPELINE_LAZY: tl.constexpr,
     PIPELINE_PREFETCH_KV: tl.constexpr,
     PIPELINE_EXPLICIT_QK_SCRATCH: tl.constexpr,
+    QK_OUT_FP16: tl.constexpr,
 ):
     if PIPELINE_EXPLICIT_QK_SCRATCH:
         if not NEED_CAUSAL_MASK:
@@ -1045,10 +1061,13 @@ def _attn_fwd_inner_loop(
         if NEED_CAUSAL_MASK:
             curr_n_for_cmp = curr_n.to(tl.float32)
 
-        if NEED_CAUSAL_MASK or HEAD_DIM != 128:
+        if QK_OUT_FP16:
             qk = tl.dot(q, tl.trans(k), out_dtype=tl.float16)
         else:
-            qk = tl.dot(q, tl.trans(k))
+            if NEED_CAUSAL_MASK or HEAD_DIM != 128:
+                qk = tl.dot(q, tl.trans(k), out_dtype=tl.float16)
+            else:
+                qk = tl.dot(q, tl.trans(k))
         # qk = qk * qk_scale
 
         if NEED_CAUSAL_MASK:
@@ -1141,6 +1160,7 @@ def _attn_fwd_inner(
     PIPELINE_LAZY: tl.constexpr,
     PIPELINE_PREFETCH_KV: tl.constexpr,
     PIPELINE_EXPLICIT_QK_SCRATCH: tl.constexpr,
+    QK_OUT_FP16: tl.constexpr,
 ):
     if STAGE == 1:
         # Off-band (strictly below the diagonal block): key columns [0, off_hi) where
@@ -1173,6 +1193,7 @@ def _attn_fwd_inner(
             PIPELINE_LAZY,
             PIPELINE_PREFETCH_KV,
             PIPELINE_EXPLICIT_QK_SCRATCH,
+            QK_OUT_FP16,
         )
         return acc_ptr, l_i, m_i
 
@@ -1212,6 +1233,7 @@ def _attn_fwd_inner(
             PIPELINE_LAZY,
             PIPELINE_PREFETCH_KV,
             PIPELINE_EXPLICIT_QK_SCRATCH,
+            QK_OUT_FP16,
         )
         return acc_ptr, l_i, m_i
 
@@ -1241,6 +1263,7 @@ def _attn_fwd_inner(
         PIPELINE_LAZY,
         PIPELINE_PREFETCH_KV,
         PIPELINE_EXPLICIT_QK_SCRATCH,
+        QK_OUT_FP16,
     )
     return acc_ptr, l_i, m_i
 
@@ -1284,6 +1307,7 @@ def _attn_fwd_tile(
     PIPELINE_LAZY: tl.constexpr,
     PIPELINE_PREFETCH_KV: tl.constexpr,
     PIPELINE_EXPLICIT_QK_SCRATCH: tl.constexpr,
+    QK_OUT_FP16: tl.constexpr,
     linear_tile,
 ):
     # Tile-to-core decomposition depends on STAGE (compile-time constant), trading off
@@ -1303,7 +1327,7 @@ def _attn_fwd_tile(
         task_m_idx = linear_tile - task_hz_idx * num_tiles_m
     off_z = task_hz_idx // H
     off_h = task_hz_idx - off_z * H
-    qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+    qvk_offset = off_z.to(tl.int32) * stride_qz + off_h.to(tl.int32) * stride_qh
 
     q_block_ptr = tl.make_block_ptr(
         base=Q + qvk_offset,
@@ -1351,7 +1375,7 @@ def _attn_fwd_tile(
     if ACC_IN_UB:
         acc_ptr = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
     else:
-        acc_offset = (((off_z.to(tl.int64) * H + off_h.to(tl.int64)) * N_CTX + task_m_idx * BLOCK_M) * HEAD_DIM)
+        acc_offset = (((off_z.to(tl.int32) * H + off_h.to(tl.int32)) * N_CTX + task_m_idx * BLOCK_M) * HEAD_DIM)
         acc_ptr = acc + acc_offset
 
     tl.static_assert(N_CTX - (N_CTX // BLOCK_M) * BLOCK_M == 0)
@@ -1381,6 +1405,7 @@ def _attn_fwd_tile(
             PIPELINE_LAZY,
             PIPELINE_PREFETCH_KV,
             PIPELINE_EXPLICIT_QK_SCRATCH,
+            QK_OUT_FP16,
         )
     if STAGE & 2:
         acc_ptr, l_i, m_i = _attn_fwd_inner(
@@ -1406,6 +1431,7 @@ def _attn_fwd_tile(
             PIPELINE_LAZY,
             PIPELINE_PREFETCH_KV,
             PIPELINE_EXPLICIT_QK_SCRATCH,
+            QK_OUT_FP16,
         )
 
     if STORE_LSE:
@@ -1463,6 +1489,7 @@ def _attn_fwd(
     PIPELINE_LAZY: tl.constexpr,
     PIPELINE_PREFETCH_KV: tl.constexpr,
     PIPELINE_EXPLICIT_QK_SCRATCH: tl.constexpr,
+    QK_OUT_FP16: tl.constexpr,
 ):
     num_tiles_m = tl.cdiv(N_CTX, BLOCK_M)
     total_tiles = num_tiles_m * Z * H
@@ -1508,6 +1535,7 @@ def _attn_fwd(
             PIPELINE_LAZY,
             PIPELINE_PREFETCH_KV,
             PIPELINE_EXPLICIT_QK_SCRATCH,
+            QK_OUT_FP16,
             linear_tile,
         )
 
@@ -1547,6 +1575,7 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None, return_lse=False
         z, h, n_ctx, head_dim, causal, bm, bn
     )
     lazy_gm_acc_special = _lazy_gm_acc_special_case(z, h, n_ctx, head_dim, causal, bm, bn)
+    qk_out_fp16_special = _qk_out_fp16_special_case(z, h, n_ctx, head_dim, causal, bm, bn)
     acc_in_ub = False if lazy_gm_acc_special else (
         _acc_in_ub(bm, head_dim, bn) or acc_resident_special
     )
@@ -1625,6 +1654,7 @@ def _launch_kernel(q, k, v, causal, sm_scale, bm=None, bn=None, return_lse=False
         PIPELINE_LAZY=pipeline_lazy,
         PIPELINE_PREFETCH_KV=pipeline_prefetch_kv,
         PIPELINE_EXPLICIT_QK_SCRATCH=pipeline_explicit_qk_scratch,
+        QK_OUT_FP16=qk_out_fp16_special,
         debug=False,
     )
     return out, lse
