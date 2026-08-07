@@ -165,7 +165,7 @@ DEFAULT_TILING_PRESETS = {
     # Measured vs the original stable BM>=BN baseline: +25/53/32/30% on the 4 tuned cases.
     (128, 8, 1024, 128, True): (128, 64),    # lazy
     (128, 8, 1024, 256, True): (64, 128),    # lazy (BM<BN)
-    (128, 8, 2048, 128, True): (128, 64),    # lazy + explicit qk scratch
+    (128, 8, 2048, 128, True): (64, 256),    # stable, wide BN (BM<BN)
     (128, 8, 2048, 256, False): (128, 128),  # lazy
     (128, 8, 4096, 128, False): (128, 256),  # stable, wide BN
     (128, 8, 8192, 64, False): (128, 256),   # stable, wide BN

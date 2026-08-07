@@ -859,6 +859,69 @@ def _attn_fwd_inner_loop_lazy_kv_prefetch_pipeline(
 
 
 @triton.jit
+def _attn_fwd_inner_loop_lazy_gm_pair_acc(
+    acc_ptr,
+    l_i,
+    m_i,
+    q,
+    k_block_ptr,
+    v_block_ptr,
+    lo,
+    hi,
+    qk_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    offs_m: tl.constexpr,
+    offs_n: tl.constexpr,
+    NEED_CAUSAL_MASK: tl.constexpr,
+    N_CTX: tl.constexpr,
+    fp8_v: tl.constexpr,
+):
+    tl.static_assert(BLOCK_M == 128)
+    tl.static_assert(BLOCK_N == 256)
+    tl.static_assert(HEAD_DIM == 64)
+    tl.static_assert(not NEED_CAUSAL_MASK)
+    tl.static_assert(not fp8_v)
+
+    k_block_ptr = tl.advance(k_block_ptr, (lo, 0))
+    v_block_ptr = tl.advance(v_block_ptr, (lo, 0))
+
+    row = tl.arange(0, BLOCK_M)[:, None]
+    col_head_dim = tl.arange(0, HEAD_DIM)[None, :]
+    block2d_acc = row * HEAD_DIM + col_head_dim
+
+    for start_n in tl.range(lo, hi, BLOCK_N * 2):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+
+        k0 = tl.load(k_block_ptr)
+        v0 = tl.load(v_block_ptr)
+        qk0 = tl.dot(q, tl.trans(k0), out_dtype=tl.float16)
+        p0 = tl.math.exp(qk0)
+        l_i += tl.sum(p0, axis=1)
+        pv0 = tl.dot(p0.to(k0.dtype), v0, out_dtype=tl.float16)
+
+        k1_ptr = tl.advance(k_block_ptr, (BLOCK_N, 0))
+        v1_ptr = tl.advance(v_block_ptr, (BLOCK_N, 0))
+        k1 = tl.load(k1_ptr)
+        v1 = tl.load(v1_ptr)
+        qk1 = tl.dot(q, tl.trans(k1), out_dtype=tl.float16)
+        p1 = tl.math.exp(qk1)
+        l_i += tl.sum(p1, axis=1)
+        pv1 = tl.dot(p1.to(k1.dtype), v1, out_dtype=tl.float16)
+
+        acc = tl.load(acc_ptr + block2d_acc)
+        acc = acc + pv0
+        acc = acc + pv1
+        tl.store(acc_ptr + block2d_acc, acc)
+
+        v_block_ptr = tl.advance(v_block_ptr, (BLOCK_N * 2, 0))
+        k_block_ptr = tl.advance(k_block_ptr, (BLOCK_N * 2, 0))
+
+    return acc_ptr, l_i, m_i
+
+
+@triton.jit
 def _attn_fwd_inner_loop_explicit_qk_scratch_pipeline(
     acc_ptr,
     l_i,
@@ -959,6 +1022,32 @@ def _attn_fwd_inner_loop(
     PIPELINE_EXPLICIT_QK_SCRATCH: tl.constexpr,
     QK_OUT_FP16: tl.constexpr,
 ):
+    if not NEED_CAUSAL_MASK:
+        if not USE_MAX:
+            if not ACC_IN_UB:
+                if BLOCK_M == 128:
+                    if BLOCK_N == 256:
+                        if HEAD_DIM == 64:
+                            return _attn_fwd_inner_loop_lazy_gm_pair_acc(
+                                acc_ptr,
+                                l_i,
+                                m_i,
+                                q,
+                                k_block_ptr,
+                                v_block_ptr,
+                                lo,
+                                hi,
+                                qk_scale,
+                                BLOCK_M,
+                                HEAD_DIM,
+                                BLOCK_N,
+                                offs_m,
+                                offs_n,
+                                NEED_CAUSAL_MASK,
+                                N_CTX,
+                                fp8_v,
+                            )
+
     if PIPELINE_EXPLICIT_QK_SCRATCH:
         if not NEED_CAUSAL_MASK:
             if not USE_MAX:
@@ -1051,7 +1140,6 @@ def _attn_fwd_inner_loop(
         # Ascend compare paths are much more likely to stay vectorized with fp32 than int64/int32.
         offs_m_for_cmp = offs_m.to(tl.float32)
 
-    
     for start_n in tl.range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         curr_n = start_n + offs_n

@@ -1,0 +1,30 @@
+Evaluation Summary
+==================
+candidate_module=/workspace/new_attn/experiment_fp16_qk/flash_attention_forward_qk_outfp16_to_fp32.py
+dtype=float16, sm_scale=0.5
+performance_metric=median_us, trim_ratio=0.1, warmup=5, iters=30
+correctness_score=40.000 / 40.000, performance_score=0.000 / 60.000, total_score=40.000 / 100
+
+Correctness Cases
+-----------------
+[1] shape=(1,1,64,64, causal=False) passed=True score=2.222 max_abs_diff=0.000488 error=
+[2] shape=(1,1,64,64, causal=True) passed=True score=2.222 max_abs_diff=0.000488 error=
+[3] shape=(1,1,128,128, causal=False) passed=True score=2.222 max_abs_diff=0.000732 error=
+[4] shape=(1,1,128,128, causal=True) passed=True score=2.222 max_abs_diff=0.000977 error=
+[5] shape=(1,2,1024,64, causal=False) passed=True score=2.222 max_abs_diff=0.000244 error=
+[6] shape=(1,2,1024,64, causal=True) passed=True score=2.222 max_abs_diff=0.000580 error=
+[7] shape=(4,32,64,64, causal=False) passed=True score=2.222 max_abs_diff=0.000977 error=
+[8] shape=(4,32,64,64, causal=True) passed=True score=2.222 max_abs_diff=0.000977 error=
+[9] shape=(4,32,128,128, causal=False) passed=True score=2.222 max_abs_diff=0.001465 error=
+[10] shape=(4,32,256,128, causal=True) passed=True score=2.222 max_abs_diff=0.001465 error=
+[11] shape=(4,32,512,64, causal=True) passed=True score=2.222 max_abs_diff=0.000977 error=
+[12] shape=(4,32,1024,64, causal=False) passed=True score=2.222 max_abs_diff=0.000244 error=
+[13] shape=(4,32,1024,64, causal=True) passed=True score=2.222 max_abs_diff=0.000977 error=
+[14] shape=(4,32,1024,128, causal=False) passed=True score=2.222 max_abs_diff=0.000977 error=
+[15] shape=(4,32,2048,64, causal=True) passed=True score=2.222 max_abs_diff=0.000977 error=
+[16] shape=(4,32,2048,128, causal=False) passed=True score=2.222 max_abs_diff=0.001465 error=
+[17] shape=(4,32,4096,64, causal=False) passed=True score=2.222 max_abs_diff=0.000244 error=
+[18] shape=(128,8,1024,64, causal=False) passed=True score=2.222 max_abs_diff=0.000488 error=
+
+Performance Cases
+-----------------

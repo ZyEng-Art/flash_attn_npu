@@ -1,0 +1,113 @@
+{
+  "label": "case1_default_scratch",
+  "candidate": "/workspace/new_attn/flash_attention_forward.py",
+  "shape": {
+    "Z": 128,
+    "H": 8,
+    "N_CTX": 1024,
+    "HEAD_DIM": 128,
+    "causal": true
+  },
+  "forced_tiling": {
+    "BLOCK_M": 128,
+    "BLOCK_N": 64
+  },
+  "runtime": {
+    "selected_config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64
+    },
+    "tiling_source": "override",
+    "total_tiles": 8192,
+    "launched_programs": 20,
+    "stage": 3,
+    "acc_in_ub": true,
+    "acc_resident_special": false,
+    "lazy_gm_acc_special": false,
+    "qk_out_fp16_special": false,
+    "use_max": false
+  },
+  "env": {
+    "FA_USE_MAX": null,
+    "FA_PIPELINE_LAZY": null,
+    "FA_PIPELINE_PREFETCH_KV": null,
+    "FA_EXPLICIT_SCRATCH": null,
+    "PERSISTENT_PROGRAMS": null,
+    "TRITON_CACHE_DIR": "/workspace/new_attn/experiment_causal_paths_ab/cache_case1_default",
+    "TRITON_DUMP_DIR": null
+  },
+  "output_match": true,
+  "max_abs_diff": 0.001953125,
+  "baseline": {
+    "avg_us": 3076.304984278977,
+    "median_us": 3045.764868147671,
+    "trimmed_avg_us": 3035.8731019077823,
+    "min_us": 3004.099940881133,
+    "max_us": 3782.0201832801104,
+    "stddev_us": 165.61704557839934,
+    "cv": 0.05383635446575093,
+    "p10_us": 3008.40986892581,
+    "p90_us": 3076.1139234527946,
+    "samples_us": [
+      3004.099940881133,
+      3008.40986892581,
+      3008.40986892581,
+      3008.7700579315424,
+      3010.7900965958834,
+      3011.430148035288,
+      3013.139823451638,
+      3013.1698586046696,
+      3014.2900068312883,
+      3042.6299199461937,
+      3048.8998163491488,
+      3051.4399986714125,
+      3053.3201061189175,
+      3054.2700551450253,
+      3054.4002074748278,
+      3055.139910429716,
+      3066.8098479509354,
+      3067.0599080622196,
+      3157.600061967969,
+      3782.0201832801104
+    ],
+    "iters": 20,
+    "warmup": 3
+  },
+  "candidate_stats": {
+    "avg_us": 9329.02101194486,
+    "median_us": 9306.119987741113,
+    "trimmed_avg_us": 9308.21875226684,
+    "min_us": 9283.54007191956,
+    "max_us": 9706.499986350536,
+    "stddev_us": 88.58358329356986,
+    "cv": 0.009495485451275928,
+    "p10_us": 9291.016100905836,
+    "p90_us": 9341.449104249477,
+    "samples_us": [
+      9283.54007191956,
+      9290.080051869154,
+      9291.120106354356,
+      9295.410010963678,
+      9296.670090407133,
+      9297.990007326007,
+      9299.659868702292,
+      9299.96999911964,
+      9300.28990842402,
+      9305.11998012662,
+      9307.119995355606,
+      9309.699991717935,
+      9313.880000263453,
+      9316.320065408945,
+      9317.039977759123,
+      9318.799944594502,
+      9323.999984189868,
+      9338.41010555625,
+      9368.800092488527,
+      9706.499986350536
+    ],
+    "iters": 20,
+    "warmup": 3
+  },
+  "speedup": 0.3272862237065325,
+  "error": null
+}
