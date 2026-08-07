@@ -1,0 +1,97 @@
+{
+  "label": "case6_current",
+  "candidate": "/workspace/new_attn/flash_attention_forward.py",
+  "shape": {
+    "Z": 128,
+    "H": 8,
+    "N_CTX": 8192,
+    "HEAD_DIM": 64,
+    "causal": false
+  },
+  "forced_tiling": {
+    "BLOCK_M": 128,
+    "BLOCK_N": 256
+  },
+  "runtime": {
+    "selected_config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256
+    },
+    "tiling_source": "override",
+    "total_tiles": 65536,
+    "launched_programs": 20,
+    "stage": 1,
+    "acc_in_ub": false,
+    "acc_resident_special": false,
+    "lazy_gm_acc_special": true,
+    "qk_out_fp16_special": false,
+    "use_max": false
+  },
+  "env": {
+    "FA_USE_MAX": null,
+    "FA_PIPELINE_LAZY": null,
+    "FA_PIPELINE_PREFETCH_KV": null,
+    "FA_EXPLICIT_SCRATCH": null,
+    "PERSISTENT_PROGRAMS": null,
+    "TRITON_CACHE_DIR": "/workspace/new_attn/experiment_case6_ab/cache_current_case6",
+    "TRITON_DUMP_DIR": null
+  },
+  "output_match": true,
+  "max_abs_diff": 0.00018310546875,
+  "baseline": {
+    "avg_us": 228706.81584269428,
+    "median_us": 222067.42013804615,
+    "trimmed_avg_us": 228408.3219943568,
+    "min_us": 221176.1800572276,
+    "max_us": 239222.3901115358,
+    "stddev_us": 8311.546493979014,
+    "cv": 0.03634149014472633,
+    "p10_us": 221539.2459416762,
+    "p90_us": 238606.49790149182,
+    "samples_us": [
+      221176.1800572276,
+      221535.1399499923,
+      221576.1998668313,
+      221607.25016146898,
+      221788.1998512894,
+      222034.44014303386,
+      222100.40013305843,
+      238085.38983576,
+      238180.8201316744,
+      238564.1799774021,
+      238611.19989305735,
+      239222.3901115358
+    ],
+    "iters": 12,
+    "warmup": 3
+  },
+  "candidate_stats": {
+    "avg_us": 438371.2000174758,
+    "median_us": 438196.28504570574,
+    "trimmed_avg_us": 438200.2350175753,
+    "min_us": 437914.100009948,
+    "max_us": 440537.95002400875,
+    "stddev_us": 664.5271117476893,
+    "cv": 0.0015159004782275792,
+    "p10_us": 438040.9850506112,
+    "p90_us": 438387.7190994099,
+    "samples_us": [
+      437914.100009948,
+      438036.150066182,
+      438084.4999104738,
+      438116.99002981186,
+      438186.6999901831,
+      438190.47999568284,
+      438202.09009572864,
+      438231.53991252184,
+      438233.7499409914,
+      438325.5201391876,
+      438394.63009499013,
+      440537.95002400875
+    ],
+    "iters": 12,
+    "warmup": 3
+  },
+  "speedup": 0.5067761359840912,
+  "error": null
+}
